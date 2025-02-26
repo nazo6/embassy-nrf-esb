@@ -1,8 +1,10 @@
 use bbqueue::{BBBuffer, framed::FrameGrantR};
+use embassy_futures::select::{Either, select};
 use embassy_nrf::{
     Peripheral, interrupt,
     radio::{Instance, InterruptHandler},
 };
+use embassy_time::{Duration, Timer};
 
 use crate::{
     Error,
@@ -13,10 +15,18 @@ const FIFO_SIZE: usize = 1024;
 
 static BUF: BBBuffer<FIFO_SIZE> = BBBuffer::new();
 
+#[derive(Clone, Debug)]
+pub struct PtxConfig {
+    pub ack_timeout: Duration,
+    pub ack_retransmit_delay: Duration,
+    pub ack_retransmit_max: u8,
+}
+
 pub struct PtxRadio<'d, T: Instance, const MAX_PACKET_LEN: usize> {
     radio: Radio<'d, T, MAX_PACKET_LEN>,
     rx_buf_w: bbqueue::framed::FrameProducer<'static, FIFO_SIZE>,
     rx_buf_r: bbqueue::framed::FrameConsumer<'static, FIFO_SIZE>,
+    config: PtxConfig,
 }
 
 impl<'d, T: Instance, const MAX_PACKET_LEN: usize> PtxRadio<'d, T, MAX_PACKET_LEN> {
@@ -24,6 +34,7 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> PtxRadio<'d, T, MAX_PACKET_LE
         p: impl Peripheral<P = T> + 'd,
         irq: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'd,
         radio_config: RadioConfig,
+        ptx_config: PtxConfig,
     ) -> Result<Self, Error> {
         let (rx_buf_w, rx_buf_r) = BUF
             .try_split_framed()
@@ -33,12 +44,13 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> PtxRadio<'d, T, MAX_PACKET_LE
             radio: Radio::new(p, irq, radio_config),
             rx_buf_w,
             rx_buf_r,
+            config: ptx_config,
         })
     }
 
     /// Send data to PRX. If ack packet from PRX has payload, it will be stored in internal FIFO
     /// buffer. This data can be read by calling `recv_dequeue`.
-    pub async fn send(&mut self, pipe: u8, buf: &mut [u8], ack: bool) -> Result<(), Error> {
+    pub async fn send(&mut self, pipe: u8, buf: &[u8], ack: bool) -> Result<(), Error> {
         let r = self.radio.regs();
         if ack {
             // Start RX after TX if ack is expected
@@ -47,8 +59,25 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> PtxRadio<'d, T, MAX_PACKET_LE
 
         self.radio.send(pipe, buf, ack).await.map_err(Error::Send)?;
 
-        if ack {
-            self.recv_ack(pipe).await?;
+        'ack: {
+            if ack {
+                for _i in 0..self.config.ack_retransmit_max {
+                    let c = self.config.clone();
+                    match select(self.recv_ack(pipe), Timer::after(c.ack_timeout)).await {
+                        Either::First(Ok(())) => {
+                            break 'ack;
+                        }
+                        Either::First(Err(e)) => {
+                            return Err(e);
+                        }
+                        _ => {
+                            self.radio.send(pipe, buf, ack).await.map_err(Error::Send)?;
+                        }
+                    }
+                }
+
+                return Err(Error::AckTimeout);
+            }
         }
 
         Ok(())
@@ -68,7 +97,13 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> PtxRadio<'d, T, MAX_PACKET_LE
 
     // Receive ack and save to fifo
     async fn recv_ack(&mut self, pipe: u8) -> Result<(), Error> {
-        let (recv_pipe, packet) = self.radio.recv().await.map_err(Error::Recv)?;
+        let (recv_pipe, packet) = self
+            .radio
+            .recv(
+                1 << pipe, // Only enables pipe that sent data
+            )
+            .await
+            .map_err(Error::Recv)?;
         if pipe != recv_pipe {
             return Err(Error::InvalidAck);
         }

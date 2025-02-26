@@ -53,12 +53,12 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> PrxRadio<'d, T, MAX_PACKET_LE
     }
 
     /// Wait for received data from PTX. Also, enqueued data will be sent to PTX.
-    pub async fn recv(&mut self, buf: &mut [u8]) -> Result<(), Error> {
+    pub async fn recv(&mut self, buf: &mut [u8], enabled_pipes: u32) -> Result<(), Error> {
         let r = self.radio.regs();
         // Start TX after recv to send ack
         r.shorts().write(|w| w.set_disabled_txen(true));
 
-        let (recv_pipe, packet) = self.radio.recv().await.map_err(Error::Recv)?;
+        let (recv_pipe, packet) = self.radio.recv(enabled_pipes).await.map_err(Error::Recv)?;
         if buf.len() < packet.payload_length() as usize {
             return Err(Error::BufferTooShort);
         }

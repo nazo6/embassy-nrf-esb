@@ -202,9 +202,14 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
     /// Receive data.
     ///
     /// returns pipe number
-    pub async fn recv(&mut self) -> Result<(u8, RecvPacket<MAX_PACKET_LEN>), Error> {
+    pub async fn recv(
+        &mut self,
+        enabled_pipes: u32,
+    ) -> Result<(u8, RecvPacket<MAX_PACKET_LEN>), Error> {
         let r = self.regs();
         let waker = self.waker();
+
+        r.rxaddresses().write(|w| w.0 = enabled_pipes);
 
         self.clear_all_interrupts();
         r.events_disabled().write_value(0);

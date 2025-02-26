@@ -14,4 +14,5 @@ pub enum Error {
     BufferTooLong,
     BufferTooShort,
     InvalidAck,
+    AckTimeout,
 }
