@@ -83,8 +83,6 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
             )
         }
 
-        crate::log::info!("Config: {:?}", config);
-
         into_ref!(radio);
 
         let mut radio = Self {
@@ -211,9 +209,7 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
             w.set_disabled_rxen(ack);
         });
 
-        r.intenset().write(|w| {
-            w.set_end(true);
-        });
+        r.intenset().write(|w| w.set_disabled(true));
 
         r.txaddress().write(|w| w.set_txaddress(pipe));
         r.rxaddresses().write(|w| w.0 = 1 << pipe);
@@ -230,11 +226,12 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
         r.tasks_txen().write_value(1);
         core::future::poll_fn(|cx| {
             waker.register(cx.waker());
-
             if r.events_end().read() != 0 {
                 r.events_end().write_value(0);
                 return Poll::Ready(());
             }
+
+            r.intenset().write(|w| w.set_disabled(true));
 
             Poll::Pending
         })
@@ -249,17 +246,20 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
     ///
     /// * `enabled_pipes`: Pipes bitmask to receive
     /// * `short_tx`: Enables `disabled_txen` shortcut, that means immediately enable TX after recv
-    /// is completed.
+    ///   is completed.
     pub async fn recv(
         &mut self,
         enabled_pipes: u8,
         short_tx: bool,
     ) -> Result<(u8, RecvPacket<MAX_PACKET_LEN>), Error> {
-        debug!("receiving data");
-
         loop {
             if let Some(v) = self.recv_inner(enabled_pipes, short_tx).await? {
-                debug!("received data");
+                debug!(
+                    "Packet received. len:{},pid:{},ack:{}",
+                    v.1.payload_length(),
+                    v.1.pid(),
+                    v.1.ack()
+                );
                 break Ok(v);
             }
             info!("duplicated packet detected");
@@ -320,9 +320,9 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
             if r.events_disabled().read() != 0 {
                 r.events_disabled().write_value(0);
                 return Poll::Ready(());
-            } else {
-                r.intenset().write(|w| w.set_phyend(true));
-            };
+            }
+
+            r.intenset().write(|w| w.set_disabled(true));
 
             Poll::Pending
         })
@@ -390,6 +390,8 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
     // }
 }
 
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct RecvPacket<const N: usize>([u8; N]);
 
 impl<const N: usize> RecvPacket<N> {

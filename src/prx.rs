@@ -7,6 +7,7 @@ use embassy_nrf::{Peripheral, interrupt, radio::Instance};
 
 use crate::{
     Error,
+    log::debug,
     radio::{InterruptHandler, Radio, RadioConfig},
 };
 
@@ -26,9 +27,6 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> PrxRadio<'d, T, MAX_PACKET_LE
         irq: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'd,
         radio_config: RadioConfig,
     ) -> Result<Self, Error> {
-        crate::log::info!("{:?}", radio_config.addresses);
-        crate::log::info!("{:?}", radio_config.tx_power);
-
         let (tx_buf_w, tx_buf_r) = BUF
             .try_split_framed()
             .map_err(|_| Error::AlreadyInitialized)?;
@@ -63,6 +61,7 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> PrxRadio<'d, T, MAX_PACKET_LE
             .recv(enabled_pipes, true)
             .await
             .map_err(Error::Recv)?;
+
         if buf.len() < packet.payload_length() as usize {
             return Err(Error::BufferTooShort);
         }

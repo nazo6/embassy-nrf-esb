@@ -23,6 +23,7 @@ pub use radio::RadioConfig;
 mod pid {
     /// PID is 2 bit number.
     #[derive(Default, PartialEq, Eq, Debug, Clone, Copy)]
+    #[cfg_attr(feature = "defmt", derive(defmt::Format))]
     pub struct Pid(u8);
     impl Pid {
         pub fn new_unchecked(val: u8) -> Self {
@@ -43,7 +44,7 @@ mod pid {
     }
 }
 
-pub mod log {
+mod log {
     macro_rules! debug {
         ($($arg:tt)*) => {
             #[cfg(feature = "defmt")]
