@@ -1,0 +1,16 @@
+[package]
+name = "embassy-nrf-esb"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bbqueue = "0.5.1"
+embassy-hal-internal = "0.2.0"
+embassy-nrf = { version = "0.3.1", features = ["unstable-pac"] }
+embassy-sync = "0.6.2"
+zerocopy = { version = "0.8.20", features = ["derive"] }
+
+[features]
+_check = ["embassy-nrf/nrf52840", "fast-ru"]
+
+fast-ru = []
