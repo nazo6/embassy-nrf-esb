@@ -7,6 +7,7 @@ edition = "2024"
 bbqueue = "0.5.1"
 embassy-hal-internal = "0.2.0"
 embassy-nrf = { version = "0.3.1", features = ["unstable-pac"] }
+embassy-sync = "0.6.2"
 embassy-futures = "0.1.1"
 embassy-time = "0.4.0"
 zerocopy = { version = "0.8.20", features = ["derive"] }

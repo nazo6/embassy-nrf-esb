@@ -15,6 +15,7 @@ use embassy_nrf::{Peripheral, pac};
 use embassy_sync::waitqueue::AtomicWaker;
 
 use crate::addresses::{ADDR_LENGTH, Addresses, address_conversion};
+use crate::pid::Pid;
 
 static WAKER: AtomicWaker = AtomicWaker::new();
 
@@ -24,11 +25,22 @@ pub struct RadioConfig {
     pub addresses: Addresses,
 }
 
+impl Default for RadioConfig {
+    fn default() -> Self {
+        Self {
+            tx_power: TxPower::_0_DBM,
+            addresses: Addresses::default(),
+        }
+    }
+}
+
 /// Low-level radio
 ///
 /// NOTE: `MAX_PACKET_LEN` is `payload length + 2` bytes (Internally, it is used for S1 and LENGTH)
 pub struct Radio<'d, T: Instance, const MAX_PACKET_LEN: usize> {
     _p: PeripheralRef<'d, T>,
+    pid_send: Pid,
+    pid_recv: Option<Pid>,
 }
 
 impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> {
@@ -44,7 +56,11 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
     ) -> Self {
         into_ref!(radio);
 
-        let mut radio = Self { _p: radio };
+        let mut radio = Self {
+            _p: radio,
+            pid_send: Pid::default(),
+            pid_recv: None,
+        };
 
         let r = radio.regs();
 
@@ -157,8 +173,8 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
         // LENGTH
         temp_buf[0] = buf.len() as u8;
         // S1 PID (pid is 2bit)
-        let pid = 0;
-        temp_buf[1] = pid << 1;
+        temp_buf[1] = self.pid_send.inner() << 1;
+        self.pid_send.go_next();
         // S1 ack
         temp_buf[1] |= ack as u8;
 
@@ -200,12 +216,22 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
     }
 
     /// Receive data.
-    ///
-    /// returns pipe number
     pub async fn recv(
         &mut self,
         enabled_pipes: u32,
     ) -> Result<(u8, RecvPacket<MAX_PACKET_LEN>), Error> {
+        loop {
+            if let Some(v) = self.recv_inner(enabled_pipes).await? {
+                break Ok(v);
+            }
+        }
+    }
+
+    /// Receive data. returns Ok(None) if the packet is duplicated.
+    async fn recv_inner(
+        &mut self,
+        enabled_pipes: u32,
+    ) -> Result<Option<(u8, RecvPacket<MAX_PACKET_LEN>)>, Error> {
         let r = self.regs();
         let waker = self.waker();
 
@@ -253,7 +279,15 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
 
         let crc = r.rxcrc().read().rxcrc() as u16;
         if r.crcstatus().read().crcstatus() == vals::Crcstatus::CRCOK {
-            Ok((r.rxmatch().read().rxmatch(), RecvPacket(temp_buf)))
+            let data = RecvPacket(temp_buf);
+
+            if let Some(latest_pid) = self.pid_recv {
+                if latest_pid == data.pid() {
+                    return Ok(None);
+                }
+            }
+
+            Ok(Some((r.rxmatch().read().rxmatch(), data)))
         } else {
             Err(Error::CrcFailed(crc))
         }
@@ -313,8 +347,8 @@ impl<const N: usize> RecvPacket<N> {
         &self.0[2..self.payload_length() as usize + 2]
     }
 
-    pub fn pid(&self) -> u8 {
-        self.0[1] >> 1
+    pub fn pid(&self) -> Pid {
+        Pid::new_unchecked(self.0[1] >> 1)
     }
 
     pub fn ack(&self) -> bool {

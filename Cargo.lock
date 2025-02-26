@@ -181,6 +181,7 @@ dependencies = [
  "embassy-futures",
  "embassy-hal-internal",
  "embassy-nrf",
+ "embassy-sync",
  "embassy-time",
  "zerocopy",
 ]

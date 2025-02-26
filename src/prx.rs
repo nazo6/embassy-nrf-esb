@@ -41,6 +41,8 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> PrxRadio<'d, T, MAX_PACKET_LE
     }
 
     /// Enqueue data to be sent with ack packet
+    ///
+    /// To send data, call `recv`.
     pub fn send_enqueue(&mut self, data: &[u8]) -> Result<(), Error> {
         let mut g = self
             .tx_buf_w
@@ -53,7 +55,9 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> PrxRadio<'d, T, MAX_PACKET_LE
     }
 
     /// Wait for received data from PTX. Also, enqueued data will be sent to PTX.
-    pub async fn recv(&mut self, buf: &mut [u8], enabled_pipes: u32) -> Result<(), Error> {
+    ///
+    /// Returns the number of bytes received.
+    pub async fn recv(&mut self, buf: &mut [u8], enabled_pipes: u32) -> Result<usize, Error> {
         let r = self.radio.regs();
         // Start TX after recv to send ack
         r.shorts().write(|w| w.set_disabled_txen(true));
@@ -68,13 +72,15 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> PrxRadio<'d, T, MAX_PACKET_LE
             self.send_ack(recv_pipe).await.map_err(Error::Send)?;
         }
 
-        Ok(())
+        Ok(packet.payload_length() as usize)
     }
 
     async fn send_ack(&mut self, pipe: u8) -> Result<(), embassy_nrf::radio::Error> {
         if let Some(frame) = self.tx_buf_r.read() {
             self.radio.send(pipe, &frame, false).await?;
             frame.release();
+        } else {
+            self.radio.send(pipe, &[], false).await?;
         }
         Ok(())
     }
