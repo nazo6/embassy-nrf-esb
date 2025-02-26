@@ -14,6 +14,8 @@
 /// | prefixes1  | [0xC5, 0xC6, 0xC7, 0xC8] |
 /// | rf_channel | 2                        |
 ///
+#[derive(Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Addresses {
     /// Base address for pipe 0
     pub(crate) base0: [u8; 4],
@@ -72,4 +74,9 @@ impl Default for Addresses {
 #[inline]
 pub fn address_conversion(value: u32) -> u32 {
     value.reverse_bits()
+}
+
+#[inline]
+pub fn bytewise_bit_swap(value: u32) -> u32 {
+    value.reverse_bits().swap_bytes()
 }

@@ -2,16 +2,13 @@
 
 use bbqueue::{BBBuffer, framed::FrameGrantR};
 use embassy_futures::select::{Either, select};
-use embassy_nrf::{
-    Peripheral, interrupt,
-    radio::{Instance, InterruptHandler},
-};
+use embassy_nrf::{Peripheral, interrupt, radio::Instance};
 use embassy_time::{Duration, Timer};
 
 use crate::{
     Error,
     pid::Pid,
-    radio::{Radio, RadioConfig},
+    radio::{InterruptHandler, Radio, RadioConfig},
 };
 
 const FIFO_SIZE: usize = 1024;
@@ -67,12 +64,6 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> PtxRadio<'d, T, MAX_PACKET_LE
     ///
     /// If ack packet from PRX has payload, it will be stored in internal FIFO buffer. This data can be read by calling `recv_dequeue`.
     pub async fn send(&mut self, pipe: u8, buf: &[u8], ack: bool) -> Result<(), Error> {
-        let r = self.radio.regs();
-        if ack {
-            // Start RX after TX if ack is expected
-            r.shorts().write(|w| w.set_disabled_rxen(true));
-        }
-
         self.radio.send(pipe, buf, ack).await.map_err(Error::Send)?;
 
         'ack: {
@@ -120,6 +111,7 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> PtxRadio<'d, T, MAX_PACKET_LE
             .radio
             .recv(
                 1 << pipe, // Only enables pipe that sent data
+                false,
             )
             .await
             .map_err(Error::Recv)?;

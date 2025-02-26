@@ -11,8 +11,11 @@ embassy-sync = "0.6.2"
 embassy-futures = "0.1.1"
 embassy-time = "0.4.0"
 zerocopy = { version = "0.8.20", features = ["derive"] }
+defmt = { version = "0.3.10", optional = true }
+nrf-pac = "0.1.0"
 
 [features]
-_check = ["embassy-nrf/nrf52840", "fast-ru"]
+_check = ["embassy-nrf/nrf52840", "fast-ru", "defmt"]
 
 fast-ru = []
+defmt = ["dep:defmt", "nrf-pac/defmt", "embassy-nrf/defmt"]

@@ -3,14 +3,11 @@
 //! PRX listens data from PTX. The connection is started by PTX.
 
 use bbqueue::BBBuffer;
-use embassy_nrf::{
-    Peripheral, interrupt,
-    radio::{Instance, InterruptHandler},
-};
+use embassy_nrf::{Peripheral, interrupt, radio::Instance};
 
 use crate::{
     Error,
-    radio::{Radio, RadioConfig},
+    radio::{InterruptHandler, Radio, RadioConfig},
 };
 
 const BUF_SIZE: usize = 1024;
@@ -29,6 +26,9 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> PrxRadio<'d, T, MAX_PACKET_LE
         irq: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'd,
         radio_config: RadioConfig,
     ) -> Result<Self, Error> {
+        crate::log::info!("{:?}", radio_config.addresses);
+        crate::log::info!("{:?}", radio_config.tx_power);
+
         let (tx_buf_w, tx_buf_r) = BUF
             .try_split_framed()
             .map_err(|_| Error::AlreadyInitialized)?;
@@ -57,12 +57,12 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> PrxRadio<'d, T, MAX_PACKET_LE
     /// Wait for received data from PTX. Also, enqueued data will be sent to PTX.
     ///
     /// Returns the number of bytes received.
-    pub async fn recv(&mut self, buf: &mut [u8], enabled_pipes: u32) -> Result<usize, Error> {
-        let r = self.radio.regs();
-        // Start TX after recv to send ack
-        r.shorts().write(|w| w.set_disabled_txen(true));
-
-        let (recv_pipe, packet) = self.radio.recv(enabled_pipes).await.map_err(Error::Recv)?;
+    pub async fn recv(&mut self, buf: &mut [u8], enabled_pipes: u8) -> Result<usize, Error> {
+        let (recv_pipe, packet) = self
+            .radio
+            .recv(enabled_pipes, true)
+            .await
+            .map_err(Error::Recv)?;
         if buf.len() < packet.payload_length() as usize {
             return Err(Error::BufferTooShort);
         }

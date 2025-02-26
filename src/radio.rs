@@ -1,24 +1,48 @@
 //! Low-level radio driver for ESB
 
+use core::marker::PhantomData;
 use core::sync::atomic::{Ordering, compiler_fence};
 use core::task::Poll;
 
 use embassy_hal_internal::drop::OnDrop;
 use embassy_hal_internal::{PeripheralRef, into_ref};
 
-use embassy_nrf::interrupt::typelevel::Interrupt;
-use embassy_nrf::interrupt::{self};
-use embassy_nrf::pac::radio::vals;
-use embassy_nrf::pac::radio::vals::State as RadioState;
-use embassy_nrf::radio::{Error, Instance, InterruptHandler, TxPower};
-use embassy_nrf::{Peripheral, pac};
+use embassy_nrf::{
+    Peripheral,
+    interrupt::{self, typelevel::Interrupt},
+    pac::{
+        self,
+        radio::vals::{self, State as RadioState},
+    },
+    radio::{Error, Instance, TxPower},
+};
 use embassy_sync::waitqueue::AtomicWaker;
 
-use crate::addresses::{ADDR_LENGTH, Addresses, address_conversion};
+use crate::addresses::{ADDR_LENGTH, Addresses, address_conversion, bytewise_bit_swap};
+use crate::log::{debug, info};
 use crate::pid::Pid;
 
 static WAKER: AtomicWaker = AtomicWaker::new();
 
+pub struct InterruptHandler<T: Instance> {
+    _phantom: PhantomData<T>,
+}
+
+// FIXME: Here, hard-coaded RADIO is used as the value because `radio::Instance::regs()`
+// is not publicly available and cannot be used.
+// Probably this should not be a problem since there are no nRF devices with radio peripherals other than RADIO,
+// but if T is not RADIO this can be unsound.
+impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandler<T> {
+    unsafe fn on_interrupt() {
+        embassy_nrf::pac::RADIO
+            .intenclr()
+            .write(|w| w.0 = 0xffff_ffff);
+        WAKER.wake();
+    }
+}
+
+#[derive(Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct RadioConfig {
     /// Tx Power
     pub tx_power: TxPower,
@@ -41,12 +65,10 @@ pub struct Radio<'d, T: Instance, const MAX_PACKET_LEN: usize> {
     _p: PeripheralRef<'d, T>,
     pid_send: Pid,
     pid_recv: Option<Pid>,
+    rf_channel: u8,
 }
 
 impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> {
-    // MAX_PACKET_LEN is actually u8
-    const _OK: () = assert!(MAX_PACKET_LEN <= 255);
-
     /// # Parameters
     /// * max_packet_len: If value is Some, ESB format is DPL (dynamic payload length).
     pub fn new(
@@ -54,12 +76,22 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
         _irq: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'd,
         config: RadioConfig,
     ) -> Self {
+        const {
+            assert!(
+                MAX_PACKET_LEN <= 255,
+                "MAX_PACKET_LEN must be lower than 256"
+            )
+        }
+
+        crate::log::info!("Config: {:?}", config);
+
         into_ref!(radio);
 
         let mut radio = Self {
             _p: radio,
             pid_send: Pid::default(),
             pid_recv: None,
+            rf_channel: config.addresses.rf_channel,
         };
 
         let r = radio.regs();
@@ -71,16 +103,12 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
         // Enable NRF proprietary 2Mbit mode
         r.mode().write(|w| w.set_mode(vals::Mode::NRF_2MBIT));
 
+        // Set fast ramp-up
+        #[cfg(feature = "fast-ru")]
+        r.modecnf0().write(|w| w.set_ru(vals::Ru::FAST));
+
         // Set tx_power
         r.txpower().write(|w| w.set_txpower(config.tx_power));
-
-        // Enable shortcuts
-        r.shorts().write(|w| {
-            w.set_ready_start(true);
-            w.set_end_disable(true);
-            w.set_address_rssistart(true);
-            w.set_disabled_rssistop(true);
-        });
 
         // Set channel (frequency)
         //
@@ -110,27 +138,15 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
         r.crcpoly().write(|w| w.set_crcpoly(CRC_POLY & 0x00FF_FFFF));
         r.crccnf().write(|w| w.set_len(vals::Len::TWO));
 
-        // Set fast ramp-up
-        #[cfg(feature = "fast-ru")]
-        r.modecnf0().write(|w| w.set_ru(vals::Ru::FAST));
-
         // Set addresses
         let base0 = address_conversion(u32::from_le_bytes(config.addresses.base0));
         let base1 = address_conversion(u32::from_le_bytes(config.addresses.base1));
+        let prefix0 = bytewise_bit_swap(u32::from_le_bytes(config.addresses.prefixes0));
+        let prefix1 = bytewise_bit_swap(u32::from_le_bytes(config.addresses.prefixes1));
         r.base0().write(|w| *w = base0);
         r.base1().write(|w| *w = base1);
-        r.prefix0().write(|w| {
-            w.set_ap0(config.addresses.prefixes0[0]);
-            w.set_ap1(config.addresses.prefixes0[1]);
-            w.set_ap2(config.addresses.prefixes0[2]);
-            w.set_ap3(config.addresses.prefixes0[3]);
-        });
-        r.prefix1().write(|w| {
-            w.set_ap4(config.addresses.prefixes1[0]);
-            w.set_ap5(config.addresses.prefixes1[1]);
-            w.set_ap6(config.addresses.prefixes1[2]);
-            w.set_ap7(config.addresses.prefixes1[3]);
-        });
+        r.prefix0().write(|w| w.0 = prefix0);
+        r.prefix1().write(|w| w.0 = prefix1);
 
         // Enable NVIC interrupt
         T::Interrupt::unpend();
@@ -165,6 +181,8 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
     }
 
     pub async fn send(&mut self, pipe: u8, buf: &[u8], ack: bool) -> Result<(), Error> {
+        debug!("sending data");
+
         if buf.len() > MAX_PACKET_LEN - 2 {
             return Err(Error::BufferTooLong);
         }
@@ -183,12 +201,26 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
         let r = self.regs();
         let waker = self.waker();
 
-        self.set_packet_ptr(&mut temp_buf);
+        self.clear_all_interrupts();
+
+        r.shorts().write(|w| {
+            w.set_ready_start(true);
+            w.set_end_disable(true);
+            w.set_address_rssistart(true);
+            w.set_disabled_rssistop(true);
+            w.set_disabled_rxen(ack);
+        });
+
+        r.intenset().write(|w| {
+            w.set_end(true);
+        });
 
         r.txaddress().write(|w| w.set_txaddress(pipe));
         r.rxaddresses().write(|w| w.0 = 1 << pipe);
 
-        self.clear_all_interrupts();
+        r.frequency().write(|w| w.set_frequency(self.rf_channel));
+        self.set_packet_ptr(&mut temp_buf);
+
         r.events_address().write_value(0);
         r.events_payload().write_value(0);
         r.events_disabled().write_value(0);
@@ -204,50 +236,73 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
                 return Poll::Ready(());
             }
 
-            r.intenset().write(|w| {
-                w.set_end(true);
-            });
-
             Poll::Pending
         })
         .await;
+
+        debug!("sent data");
 
         Ok(())
     }
 
     /// Receive data.
+    ///
+    /// * `enabled_pipes`: Pipes bitmask to receive
+    /// * `short_tx`: Enables `disabled_txen` shortcut, that means immediately enable TX after recv
+    /// is completed.
     pub async fn recv(
         &mut self,
-        enabled_pipes: u32,
+        enabled_pipes: u8,
+        short_tx: bool,
     ) -> Result<(u8, RecvPacket<MAX_PACKET_LEN>), Error> {
+        debug!("receiving data");
+
         loop {
-            if let Some(v) = self.recv_inner(enabled_pipes).await? {
+            if let Some(v) = self.recv_inner(enabled_pipes, short_tx).await? {
+                debug!("received data");
                 break Ok(v);
             }
+            info!("duplicated packet detected");
         }
     }
 
     /// Receive data. returns Ok(None) if the packet is duplicated.
     async fn recv_inner(
         &mut self,
-        enabled_pipes: u32,
+        enabled_pipes: u8,
+        short_tx: bool,
     ) -> Result<Option<(u8, RecvPacket<MAX_PACKET_LEN>)>, Error> {
         let r = self.regs();
         let waker = self.waker();
 
-        r.rxaddresses().write(|w| w.0 = enabled_pipes);
-
         self.clear_all_interrupts();
-        r.events_disabled().write_value(0);
+
+        r.shorts().write(|w| {
+            w.set_ready_start(true);
+            w.set_end_disable(true);
+            w.set_address_rssistart(true);
+            w.set_disabled_rssistop(true);
+            w.set_disabled_txen(short_tx);
+        });
+
+        r.intenset().write(|w| w.set_disabled(true));
+
+        r.rxaddresses().write(|w| w.0 = enabled_pipes as u32);
+        r.frequency().write(|w| w.set_frequency(self.rf_channel));
 
         let mut temp_buf = [0u8; MAX_PACKET_LEN];
         self.set_packet_ptr(&mut temp_buf);
+
+        r.events_address().write_value(0);
+        r.events_payload().write_value(0);
+        r.events_disabled().write_value(0);
 
         // Start receive
         dma_start_fence();
         r.tasks_rxen().write_value(1);
 
         let dropper = OnDrop::new(|| {
+            debug!("receive canceled");
             // cancel receive
             r.tasks_stop().write_value(1);
             loop {
@@ -262,9 +317,8 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
         core::future::poll_fn(|cx| {
             waker.register(cx.waker());
 
-            if r.events_end().read() != 0 {
-                r.events_phyend().write_value(0);
-                // trace!("RX done poll");
+            if r.events_disabled().read() != 0 {
+                r.events_disabled().write_value(0);
                 return Poll::Ready(());
             } else {
                 r.intenset().write(|w| w.set_phyend(true));
