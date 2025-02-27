@@ -1,4 +1,6 @@
-/// Addresses used for communication.
+//! Pipe addresses
+
+/// Addresses of pipes to be used for communication.
 ///
 /// ESB uses up to eight pipes to address communication, each pipe has an unique address which is
 /// composed by the base address and the prefix. Pipe 0 has an unique base and prefix, while the
@@ -29,7 +31,7 @@ pub struct Addresses {
     pub(crate) rf_channel: u8,
 }
 
-pub const ADDR_LENGTH: u8 = 4 + 1;
+pub(crate) const ADDR_LENGTH: u8 = 4 + 1;
 
 impl Addresses {
     /// Creates a new instance of `Addresses`
@@ -72,11 +74,11 @@ impl Default for Addresses {
 }
 
 #[inline]
-pub fn address_conversion(value: u32) -> u32 {
+pub(crate) fn address_conversion(value: u32) -> u32 {
     value.reverse_bits()
 }
 
 #[inline]
-pub fn bytewise_bit_swap(value: u32) -> u32 {
+pub(crate) fn bytewise_bit_swap(value: u32) -> u32 {
     value.reverse_bits().swap_bytes()
 }

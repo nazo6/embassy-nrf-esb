@@ -77,5 +77,3 @@ async fn main(_spawner: Spawner) {
     }
 }
 ```
-
-- PTX side

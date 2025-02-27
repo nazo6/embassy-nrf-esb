@@ -6,18 +6,16 @@ use bbqueue::BBBuffer;
 use embassy_nrf::{Peripheral, interrupt, radio::Instance};
 
 use crate::{
-    Error,
+    Error, FIFO_SIZE,
     radio::{InterruptHandler, Radio, RadioConfig},
 };
 
-const BUF_SIZE: usize = 1024;
-
-static BUF: BBBuffer<BUF_SIZE> = BBBuffer::new();
+static BUF: BBBuffer<FIFO_SIZE> = BBBuffer::new();
 
 pub struct PrxRadio<'d, T: Instance, const MAX_PACKET_LEN: usize> {
     radio: Radio<'d, T, MAX_PACKET_LEN>,
-    tx_buf_w: bbqueue::framed::FrameProducer<'static, BUF_SIZE>,
-    tx_buf_r: bbqueue::framed::FrameConsumer<'static, BUF_SIZE>,
+    tx_buf_w: bbqueue::framed::FrameProducer<'static, FIFO_SIZE>,
+    tx_buf_r: bbqueue::framed::FrameConsumer<'static, FIFO_SIZE>,
 }
 
 impl<'d, T: Instance, const MAX_PACKET_LEN: usize> PrxRadio<'d, T, MAX_PACKET_LEN> {

@@ -6,15 +6,13 @@ use embassy_nrf::{Peripheral, interrupt, radio::Instance};
 use embassy_time::{Duration, Timer};
 
 use crate::{
-    Error,
-    pid::Pid,
-    radio::{InterruptHandler, Radio, RadioConfig},
+    Error, FIFO_SIZE,
+    radio::{InterruptHandler, Radio, RadioConfig, pid::Pid},
 };
-
-const FIFO_SIZE: usize = 1024;
 
 static BUF: BBBuffer<FIFO_SIZE> = BBBuffer::new();
 
+/// Config specific to PTX
 #[derive(Clone, Debug)]
 pub struct PtxConfig {
     pub ack_timeout: Duration,

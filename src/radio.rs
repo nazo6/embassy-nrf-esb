@@ -1,4 +1,7 @@
 //! Low-level radio driver for ESB
+//!
+//! Usually, you don't need to use this module directly. Instead, use the [`crate::ptx`] or
+//! [`crate::prx`] module.
 
 use core::marker::PhantomData;
 use core::sync::atomic::{Ordering, compiler_fence};
@@ -20,7 +23,9 @@ use embassy_sync::waitqueue::AtomicWaker;
 
 use crate::addresses::{ADDR_LENGTH, Addresses, address_conversion, bytewise_bit_swap};
 use crate::log::{debug, info};
-use crate::pid::Pid;
+use pid::Pid;
+
+pub mod pid;
 
 static WAKER: AtomicWaker = AtomicWaker::new();
 
@@ -69,8 +74,10 @@ pub struct Radio<'d, T: Instance, const MAX_PACKET_LEN: usize> {
 }
 
 impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> {
-    /// # Parameters
-    /// * max_packet_len: If value is Some, ESB format is DPL (dynamic payload length).
+    /// Creates a new instance of `Radio`
+    ///
+    /// **IMPORTANT**: Do **NOT** use peripheral other than [`embassy_nrf::peripherals::RADIO`].
+    /// It can cause unexpected behavior.
     pub fn new(
         radio: impl Peripheral<P = T> + 'd,
         _irq: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'd,
@@ -178,6 +185,14 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
         self.regs().packetptr().write_value(buffer.as_ptr() as u32);
     }
 
+    /// Transmits data
+    ///
+    /// # Parameters
+    /// * `pipe`: Pipe (channel) number
+    /// * `buf`: Data to send
+    /// * `ack`: Whether ACK is required or not. This is usually false in PRX.
+    ///
+    /// **NOTE**: If `ack` is true, radio will automatically enter RX mode after send. In such a case, send cannot be executed again unless the recv method is executed!
     pub async fn send(&mut self, pipe: u8, buf: &[u8], ack: bool) -> Result<(), Error> {
         debug!("sending data");
 
@@ -242,11 +257,15 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
         Ok(())
     }
 
-    /// Receive data.
+    /// Receives data.
     ///
-    /// * `enabled_pipes`: Pipes bitmask to receive
+    /// # Parameters
+    /// * `enabled_pipes`: Pipes bitmask to receive. For example `0xFF` will enable all pipes.
     /// * `short_tx`: Enables `disabled_txen` shortcut, that means immediately enable TX after recv
-    ///   is completed.
+    ///   is completed. This is usually used by PRX to send ACK to PTX.
+    ///
+    /// **NOTE**: If `short_tx` is true, radio will automatically enter TX mode after receive.
+    /// In such a case, recv cannot be executed again unless the send method is executed!
     pub async fn recv(
         &mut self,
         enabled_pipes: u8,
@@ -339,7 +358,11 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
                 if latest_pid == data.pid() {
                     return Ok(None);
                 }
+                if !latest_pid.is_next(&data.pid()) {
+                    crate::log::debug!("Invalid pid: {}->{}", latest_pid, data.pid());
+                }
             }
+            self.pid_recv = Some(data.pid());
 
             Ok(Some((r.rxmatch().read().rxmatch(), data)))
         } else {
@@ -413,12 +436,12 @@ impl<const N: usize> RecvPacket<N> {
 }
 
 /// NOTE must be followed by a volatile write operation
-pub fn dma_start_fence() {
+pub(crate) fn dma_start_fence() {
     compiler_fence(Ordering::Release);
 }
 
 /// NOTE must be preceded by a volatile read operation
-pub fn dma_end_fence() {
+pub(crate) fn dma_end_fence() {
     compiler_fence(Ordering::Acquire);
 }
 
