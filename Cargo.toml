@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bbqueue = "0.5.1"
+bbq2 = { git = "https://github.com/jamesmunns/bbq2", default-features = false, features = [
+  "cas-atomics",
+  "maitake-sync-0_1",
+] }
 embassy-hal-internal = "0.2.0"
 embassy-nrf = { version = "0.3.1", features = ["unstable-pac"] }
 embassy-sync = "0.6.2"

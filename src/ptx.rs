@@ -1,16 +1,15 @@
 //! ESB driver for PTX side
-
-use bbqueue::{BBBuffer, framed::FrameGrantR};
 use embassy_futures::select::{Either, select};
 use embassy_nrf::{Peripheral, interrupt, radio::Instance};
 use embassy_time::{Duration, Timer};
 
 use crate::{
-    Error, FIFO_SIZE,
-    radio::{InterruptHandler, Radio, RadioConfig, pid::Pid},
+    Consumer, Error, GrantR, Producer, Queue, RX_BUF_SIZE,
+    pid::Pid,
+    radio::{InterruptHandler, Packet, Radio, RadioConfig},
 };
 
-static BUF: BBBuffer<FIFO_SIZE> = BBBuffer::new();
+static BUF: Queue<RX_BUF_SIZE> = Queue::new();
 
 /// Config specific to PTX
 #[derive(Clone, Debug)]
@@ -32,10 +31,11 @@ impl Default for PtxConfig {
 
 pub struct PtxRadio<'d, T: Instance, const MAX_PACKET_LEN: usize> {
     radio: Radio<'d, T, MAX_PACKET_LEN>,
-    rx_buf_w: bbqueue::framed::FrameProducer<'static, FIFO_SIZE>,
-    rx_buf_r: bbqueue::framed::FrameConsumer<'static, FIFO_SIZE>,
+    rx_buf_w: Producer<RX_BUF_SIZE>,
+    rx_buf_r: Consumer<RX_BUF_SIZE>,
     config: PtxConfig,
-    latest_pid: Option<Pid>,
+    last_sent_pid: Pid,
+    last_recv_pid: Option<Pid>,
 }
 
 impl<'d, T: Instance, const MAX_PACKET_LEN: usize> PtxRadio<'d, T, MAX_PACKET_LEN> {
@@ -45,16 +45,13 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> PtxRadio<'d, T, MAX_PACKET_LE
         radio_config: RadioConfig,
         ptx_config: PtxConfig,
     ) -> Result<Self, Error> {
-        let (rx_buf_w, rx_buf_r) = BUF
-            .try_split_framed()
-            .map_err(|_| Error::AlreadyInitialized)?;
-
         Ok(Self {
             radio: Radio::new(p, irq, radio_config),
-            rx_buf_w,
-            rx_buf_r,
+            rx_buf_w: BUF.framed_producer(),
+            rx_buf_r: BUF.framed_consumer(),
             config: ptx_config,
-            latest_pid: None,
+            last_sent_pid: Pid::default(),
+            last_recv_pid: None,
         })
     }
 
@@ -62,7 +59,16 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> PtxRadio<'d, T, MAX_PACKET_LE
     ///
     /// If ack packet from PRX has payload, it will be stored in internal FIFO buffer. This data can be read by calling `recv_dequeue`.
     pub async fn send(&mut self, pipe: u8, buf: &[u8], ack: bool) -> Result<(), Error> {
-        self.radio.send(pipe, buf, ack).await.map_err(Error::Send)?;
+        self.last_sent_pid.go_next();
+        let mut packet = match Packet::new(buf, self.last_sent_pid, ack) {
+            Ok(p) => p,
+            Err(e) => return Err(Error::Send(e)),
+        };
+
+        self.radio
+            .send(pipe, &mut packet)
+            .await
+            .map_err(Error::Send)?;
 
         'ack: {
             if ack {
@@ -77,7 +83,11 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> PtxRadio<'d, T, MAX_PACKET_LE
                         }
                         _ => {
                             Timer::after(c.ack_retransmit_delay).await;
-                            self.radio.send(pipe, buf, ack).await.map_err(Error::Send)?;
+                            self.last_sent_pid.go_next();
+                            self.radio
+                                .send(pipe, &mut packet)
+                                .await
+                                .map_err(Error::Send)?;
                         }
                     }
                 }
@@ -92,25 +102,17 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> PtxRadio<'d, T, MAX_PACKET_LE
     /// Receive ack paylod data sent from PRX.
     ///
     /// This data is received when sending data and is stored in internal FIFO buffer.
-    pub fn recv_dequeue(&mut self) -> impl Iterator<Item = FrameGrantR<'static, FIFO_SIZE>> {
-        core::iter::from_fn(|| {
-            if let Some(mut frame) = self.rx_buf_r.read() {
-                frame.auto_release(true);
-                Some(frame)
-            } else {
-                None
-            }
-        })
+    ///
+    /// NOTE: Make sure to call release on the grant after processing the data.
+    pub fn recv_dequeue(&mut self) -> impl Iterator<Item = GrantR<'static, RX_BUF_SIZE>> {
+        core::iter::from_fn(|| self.rx_buf_r.read().ok())
     }
 
     // Receive ack and save to fifo
     async fn recv_ack(&mut self, pipe: u8) -> Result<(), Error> {
         let (recv_pipe, packet) = self
             .radio
-            .recv(
-                1 << pipe, // Only enables pipe that sent data
-                false,
-            )
+            .recv_once(1 << pipe, false)
             .await
             .map_err(Error::Recv)?;
 
@@ -118,20 +120,20 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> PtxRadio<'d, T, MAX_PACKET_LE
             return Err(Error::InvalidAck);
         }
 
-        if let Some(latest_pid) = self.latest_pid {
+        if let Some(latest_pid) = self.last_recv_pid {
             // pid was same as latest packet. PRX should have received the packet
             if latest_pid == packet.pid() {
                 return Ok(());
             }
         }
-        if packet.payload_length() > 0 {
-            self.latest_pid = Some(packet.pid());
+        if !packet.payload().is_empty() {
+            self.last_recv_pid = Some(packet.pid());
             let mut g = self
                 .rx_buf_w
-                .grant(packet.payload_length() as usize)
+                .grant(packet.payload().len() as u16)
                 .map_err(|_| Error::BufferTooLong)?;
             g.copy_from_slice(packet.payload());
-            g.commit(packet.payload_length() as usize);
+            g.commit(packet.payload().len() as u16);
         }
 
         Ok(())

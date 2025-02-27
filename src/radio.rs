@@ -22,10 +22,8 @@ use embassy_nrf::{
 use embassy_sync::waitqueue::AtomicWaker;
 
 use crate::addresses::{ADDR_LENGTH, Addresses, address_conversion, bytewise_bit_swap};
-use crate::log::{debug, info};
-use pid::Pid;
-
-pub mod pid;
+use crate::log::debug;
+use crate::pid::Pid;
 
 static WAKER: AtomicWaker = AtomicWaker::new();
 
@@ -68,8 +66,6 @@ impl Default for RadioConfig {
 /// NOTE: `MAX_PACKET_LEN` is `payload length + 2` bytes (Internally, it is used for S1 and LENGTH)
 pub struct Radio<'d, T: Instance, const MAX_PACKET_LEN: usize> {
     _p: PeripheralRef<'d, T>,
-    pid_send: Pid,
-    pid_recv: Option<Pid>,
     rf_channel: u8,
 }
 
@@ -87,6 +83,10 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
             assert!(
                 MAX_PACKET_LEN <= 255,
                 "MAX_PACKET_LEN must be lower than 256"
+            );
+            assert!(
+                MAX_PACKET_LEN >= 3,
+                "MAX_PACKET_LEN must be greater than or equal to 3"
             )
         }
 
@@ -94,8 +94,6 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
 
         let mut radio = Self {
             _p: radio,
-            pid_send: Pid::default(),
-            pid_recv: None,
             rf_channel: config.addresses.rf_channel,
         };
 
@@ -181,8 +179,10 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
     // Set pointer to be used for DMA transfer
     //
     // buffer task mutable reference to ensure that the buffer is in RAM.
-    fn set_packet_ptr(&mut self, buffer: &mut [u8]) {
-        self.regs().packetptr().write_value(buffer.as_ptr() as u32);
+    pub fn set_packet_ptr(&mut self, packet: &mut Packet<MAX_PACKET_LEN>) {
+        self.regs()
+            .packetptr()
+            .write_value(packet.0.as_ptr() as u32);
     }
 
     /// Transmits data
@@ -193,29 +193,19 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
     /// * `ack`: Whether ACK is required or not. This is usually false in PRX.
     ///
     /// **NOTE**: If `ack` is true, radio will automatically enter RX mode after send. In such a case, send cannot be executed again unless the recv method is executed!
-    pub async fn send(&mut self, pipe: u8, buf: &[u8], ack: bool) -> Result<(), Error> {
+    pub async fn send(
+        &mut self,
+        pipe: u8,
+        packet: &mut Packet<MAX_PACKET_LEN>,
+    ) -> Result<(), Error> {
         debug!("sending data");
-
-        if buf.len() > MAX_PACKET_LEN - 2 {
-            return Err(Error::BufferTooLong);
-        }
-
-        let mut temp_buf = [0u8; MAX_PACKET_LEN];
-        // LENGTH
-        temp_buf[0] = buf.len() as u8;
-        // S1 PID (pid is 2bit)
-        temp_buf[1] = self.pid_send.inner() << 1;
-        self.pid_send.go_next();
-        // S1 ack
-        temp_buf[1] |= ack as u8;
-
-        temp_buf[2..buf.len() + 2].copy_from_slice(buf);
 
         let r = self.regs();
         let waker = self.waker();
 
         self.clear_all_interrupts();
 
+        let ack = packet.ack();
         r.shorts().write(|w| {
             w.set_ready_start(true);
             w.set_end_disable(true);
@@ -230,7 +220,7 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
         r.rxaddresses().write(|w| w.0 = 1 << pipe);
 
         r.frequency().write(|w| w.set_frequency(self.rf_channel));
-        self.set_packet_ptr(&mut temp_buf);
+        self.set_packet_ptr(packet);
 
         r.events_address().write_value(0);
         r.events_payload().write_value(0);
@@ -257,42 +247,27 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
         Ok(())
     }
 
-    /// Receives data.
-    ///
-    /// # Parameters
-    /// * `enabled_pipes`: Pipes bitmask to receive. For example `0xFF` will enable all pipes.
-    /// * `short_tx`: Enables `disabled_txen` shortcut, that means immediately enable TX after recv
-    ///   is completed. This is usually used by PRX to send ACK to PTX.
-    ///
-    /// **NOTE**: If `short_tx` is true, radio will automatically enter TX mode after receive.
-    /// In such a case, recv cannot be executed again unless the send method is executed!
-    pub async fn recv(
+    // ---------------------------------------------------------------------
+    // ------------------------------  RECV  -------------------------------
+    // ---------------------------------------------------------------------
+
+    pub async fn recv_once(
         &mut self,
         enabled_pipes: u8,
         short_tx: bool,
-    ) -> Result<(u8, RecvPacket<MAX_PACKET_LEN>), Error> {
-        loop {
-            if let Some(v) = self.recv_inner(enabled_pipes, short_tx).await? {
-                debug!(
-                    "Packet received. len:{},pid:{},ack:{}",
-                    v.1.payload_length(),
-                    v.1.pid(),
-                    v.1.ack()
-                );
-                break Ok(v);
-            }
-            info!("duplicated packet detected");
-        }
+    ) -> Result<(u8, Packet<MAX_PACKET_LEN>), Error> {
+        let mut packet = Packet::new_empty();
+        self.set_packet_ptr(&mut packet);
+        self.prepare_recv(short_tx, enabled_pipes);
+        let pipe = self.perform_recv().await?;
+
+        Ok((pipe, packet))
     }
 
-    /// Receive data. returns Ok(None) if the packet is duplicated.
-    async fn recv_inner(
-        &mut self,
-        enabled_pipes: u8,
-        short_tx: bool,
-    ) -> Result<Option<(u8, RecvPacket<MAX_PACKET_LEN>)>, Error> {
+    // -------- RECV utils --------
+
+    pub fn prepare_recv(&mut self, short_tx: bool, enabled_pipes: u8) {
         let r = self.regs();
-        let waker = self.waker();
 
         self.clear_all_interrupts();
 
@@ -304,17 +279,23 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
             w.set_disabled_txen(short_tx);
         });
 
-        r.intenset().write(|w| w.set_disabled(true));
-
         r.rxaddresses().write(|w| w.0 = enabled_pipes as u32);
         r.frequency().write(|w| w.set_frequency(self.rf_channel));
-
-        let mut temp_buf = [0u8; MAX_PACKET_LEN];
-        self.set_packet_ptr(&mut temp_buf);
 
         r.events_address().write_value(0);
         r.events_payload().write_value(0);
         r.events_disabled().write_value(0);
+    }
+
+    /// Receive data to buffer specified by `set_packet_ptr`.
+    ///
+    /// Returns the pipe number of the received data.
+    pub async fn perform_recv(&mut self) -> Result<u8, Error> {
+        let r = self.regs();
+        let waker = self.waker();
+
+        self.clear_all_interrupts();
+        r.intenset().write(|w| w.set_disabled(true));
 
         // Start receive
         dma_start_fence();
@@ -322,7 +303,6 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
 
         let dropper = OnDrop::new(|| {
             debug!("receive canceled");
-            // cancel receive
             r.tasks_stop().write_value(1);
             loop {
                 match self.read_state() {
@@ -336,8 +316,8 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
         core::future::poll_fn(|cx| {
             waker.register(cx.waker());
 
-            if r.events_disabled().read() != 0 {
-                r.events_disabled().write_value(0);
+            if r.events_end().read() != 0 {
+                r.events_end().write_value(0);
                 return Poll::Ready(());
             }
 
@@ -348,23 +328,21 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
         .await;
 
         dma_end_fence();
+
         dropper.defuse();
 
+        let pipe = self.check_crc()?;
+
+        Ok(pipe)
+    }
+
+    /// Check CRC of reseived data and returns wrapped data and address if it is proper
+    /// data.
+    fn check_crc(&mut self) -> Result<u8, Error> {
+        let r = self.regs();
         let crc = r.rxcrc().read().rxcrc() as u16;
         if r.crcstatus().read().crcstatus() == vals::Crcstatus::CRCOK {
-            let data = RecvPacket(temp_buf);
-
-            if let Some(latest_pid) = self.pid_recv {
-                if latest_pid == data.pid() {
-                    return Ok(None);
-                }
-                if !latest_pid.is_next(&data.pid()) {
-                    crate::log::debug!("Invalid pid: {}->{}", latest_pid, data.pid());
-                }
-            }
-            self.pid_recv = Some(data.pid());
-
-            Ok(Some((r.rxmatch().read().rxmatch(), data)))
+            Ok(r.rxmatch().read().rxmatch())
         } else {
             Err(Error::CrcFailed(crc))
         }
@@ -413,12 +391,38 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
     // }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct RecvPacket<const N: usize>([u8; N]);
+pub struct Packet<const N: usize>(pub(crate) [u8; N]);
 
-impl<const N: usize> RecvPacket<N> {
-    pub fn payload_length(&self) -> u8 {
+impl<const N: usize> Packet<N> {
+    /// Creates new packet which is empty. This is used for receiving data.
+    pub fn new_empty() -> Self {
+        const {
+            assert!(N >= 3);
+        }
+        Self([0; N])
+    }
+
+    /// Creates new packet from given payload. This is used for sending data.
+    pub fn new(payload: &[u8], pid: Pid, ack: bool) -> Result<Self, Error> {
+        const {
+            assert!(N >= 3);
+        }
+        if payload.len() > N - 2 {
+            Err(Error::BufferTooLong)
+        } else {
+            let mut buf = [0; N];
+            buf[0] = payload.len() as u8;
+            buf[2..payload.len() + 2].copy_from_slice(payload);
+            let mut p = Self(buf);
+            p.set_pid(pid);
+            p.set_ack(ack);
+            Ok(p)
+        }
+    }
+
+    fn payload_length(&self) -> u8 {
         self.0[0]
     }
 
@@ -432,6 +436,19 @@ impl<const N: usize> RecvPacket<N> {
 
     pub fn ack(&self) -> bool {
         self.0[1] & 1 != 0
+    }
+
+    pub(crate) fn set_ack(&mut self, ack: bool) {
+        if ack {
+            self.0[1] |= 1;
+        } else {
+            self.0[1] &= !1;
+        }
+    }
+
+    pub(crate) fn set_pid(&mut self, pid: Pid) {
+        self.0[1] &= !0b11;
+        self.0[1] |= pid.inner() << 1;
     }
 }
 

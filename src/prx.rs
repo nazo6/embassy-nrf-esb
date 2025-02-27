@@ -1,83 +1,124 @@
-//! ESB driver for PRX side
-//!
-//! PRX listens data from PTX. The connection is started by PTX.
-
-use bbqueue::BBBuffer;
 use embassy_nrf::{Peripheral, interrupt, radio::Instance};
 
 use crate::{
-    Error, FIFO_SIZE,
-    radio::{InterruptHandler, Radio, RadioConfig},
+    Consumer, Error, InterruptHandler, Producer, Queue, RX_BUF_SIZE, RadioConfig, TX_BUF_SIZE,
+    log::warn,
+    pid::Pid,
+    radio::{Packet, Radio},
 };
 
-static BUF: BBBuffer<FIFO_SIZE> = BBBuffer::new();
+static TX_BUF: Queue<TX_BUF_SIZE> = Queue::new();
+static RX_BUF: Queue<RX_BUF_SIZE> = Queue::new();
 
-pub struct PrxRadio<'d, T: Instance, const MAX_PACKET_LEN: usize> {
-    radio: Radio<'d, T, MAX_PACKET_LEN>,
-    tx_buf_w: bbqueue::framed::FrameProducer<'static, FIFO_SIZE>,
-    tx_buf_r: bbqueue::framed::FrameConsumer<'static, FIFO_SIZE>,
+pub fn new_prx<T: Instance, const MAX_PACKET_LEN: usize>(
+    radio: impl Peripheral<P = T> + 'static,
+    irq: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'static,
+    config: RadioConfig,
+) -> (PrxTask<T, MAX_PACKET_LEN>, PrxInterface) {
+    (
+        PrxTask {
+            radio: Radio::new(radio, irq, config),
+            tx_buf_r: TX_BUF.framed_consumer(),
+            rx_buf_w: RX_BUF.framed_producer(),
+        },
+        PrxInterface {
+            tx_buf_w: TX_BUF.framed_producer(),
+            rx_buf_r: RX_BUF.framed_consumer(),
+        },
+    )
 }
 
-impl<'d, T: Instance, const MAX_PACKET_LEN: usize> PrxRadio<'d, T, MAX_PACKET_LEN> {
-    pub fn new(
-        p: impl Peripheral<P = T> + 'd,
-        irq: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'd,
-        radio_config: RadioConfig,
-    ) -> Result<Self, Error> {
-        let (tx_buf_w, tx_buf_r) = BUF
-            .try_split_framed()
-            .map_err(|_| Error::AlreadyInitialized)?;
+pub struct PrxTask<T: Instance, const MAX_PACKET_LEN: usize> {
+    radio: Radio<'static, T, MAX_PACKET_LEN>,
+    tx_buf_r: Consumer<TX_BUF_SIZE>,
+    rx_buf_w: Producer<RX_BUF_SIZE>,
+}
 
-        Ok(Self {
-            radio: Radio::new(p, irq, radio_config),
-            tx_buf_w,
-            tx_buf_r,
-        })
+impl<T: Instance, const MAX_PACKET_LEN: usize> PrxTask<T, MAX_PACKET_LEN> {
+    pub async fn run(&mut self) {
+        let mut latest_recv_pid: Option<Pid> = None;
+        let mut latest_sent_pid = Pid::default();
+
+        let mut packet = Packet::new_empty();
+        self.radio.set_packet_ptr(&mut packet);
+        self.radio.prepare_recv(false, 0xFF);
+        loop {
+            match self.radio.perform_recv().await {
+                Ok(pipe) => {
+                    if let Some(latest_recv_pid) = latest_recv_pid {
+                        if latest_recv_pid == packet.pid() {
+                            warn!("Duplicate packet received");
+                            continue;
+                        } else if !packet.pid().is_next_of(&latest_recv_pid) {
+                            warn!(
+                                "Invalid packet order: {} -> {}",
+                                latest_recv_pid,
+                                packet.pid()
+                            );
+                        }
+                    }
+                    latest_recv_pid = Some(packet.pid());
+
+                    let ack = packet.ack();
+                    let Ok(mut g) = self.rx_buf_w.grant(packet.payload().len() as u16) else {
+                        continue;
+                    };
+                    g.copy_from_slice(packet.payload());
+                    g.commit(packet.payload().len() as u16);
+
+                    if ack {
+                        let res = if let Ok(ack_payload) = self.tx_buf_r.read() {
+                            latest_sent_pid.go_next();
+                            match Packet::new(&ack_payload, latest_sent_pid, false) {
+                                Ok(mut p) => self.radio.send(pipe, &mut p).await,
+                                Err(e) => {
+                                    warn!("Ack data too long: {:?}", e);
+                                    continue;
+                                }
+                            }
+                        } else {
+                            self.radio.send(pipe, &mut Packet::new_empty()).await
+                        };
+                        if let Err(e) = res {
+                            warn!("Ack Send error: {:?}", e);
+                        }
+
+                        // When ack is sent, we must prepare recv again.
+                        self.radio.set_packet_ptr(&mut packet);
+                        self.radio.prepare_recv(false, 0xFF);
+                    }
+                }
+                Err(e) => {
+                    warn!("Receive error: {:?}", e);
+                }
+            }
+        }
     }
+}
 
-    /// Enqueue data to be sent with ack packet
-    ///
-    /// To send data, call `recv`.
-    pub fn send_enqueue(&mut self, data: &[u8]) -> Result<(), Error> {
-        let mut g = self
-            .tx_buf_w
-            .grant(data.len())
-            .map_err(|_| Error::BufferTooLong)?;
-        g.copy_from_slice(data);
-        g.commit(data.len());
+pub struct PrxInterface {
+    tx_buf_w: Producer<TX_BUF_SIZE>,
+    rx_buf_r: Consumer<RX_BUF_SIZE>,
+}
 
-        Ok(())
-    }
-
-    /// Wait for received data from PTX. Also, enqueued data will be sent to PTX.
-    ///
-    /// Returns the number of bytes received.
-    pub async fn recv(&mut self, buf: &mut [u8], enabled_pipes: u8) -> Result<usize, Error> {
-        let (recv_pipe, packet) = self
-            .radio
-            .recv(enabled_pipes, false)
-            .await
-            .map_err(Error::Recv)?;
-
-        if buf.len() < packet.payload_length() as usize {
+impl PrxInterface {
+    pub async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        let g = self.rx_buf_r.wait_read().await;
+        let len = g.len();
+        if buf.len() < len {
             return Err(Error::BufferTooShort);
         }
-        buf[..packet.payload_length() as usize].copy_from_slice(packet.payload());
 
-        if packet.ack() {
-            self.send_ack(recv_pipe).await.map_err(Error::Send)?;
-        }
+        buf[..len].copy_from_slice(&g);
 
-        Ok(packet.payload_length() as usize)
+        g.release();
+
+        Ok(len)
     }
 
-    async fn send_ack(&mut self, pipe: u8) -> Result<(), embassy_nrf::radio::Error> {
-        if let Some(frame) = self.tx_buf_r.read() {
-            self.radio.send(pipe, &frame, false).await?;
-            frame.release();
-        } else {
-            self.radio.send(pipe, &[], false).await?;
-        }
-        Ok(())
+    pub async fn send(&mut self, buf: &[u8]) {
+        let mut g = self.tx_buf_w.wait_grant(buf.len() as u16).await;
+        g.copy_from_slice(buf);
+        g.commit(buf.len() as u16);
     }
 }

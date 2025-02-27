@@ -15,17 +15,40 @@
 
 pub mod addresses;
 mod log;
+pub mod pid;
 pub mod prx;
 pub mod ptx;
 pub mod radio;
 
+use bbq2::prod_cons::framed::FramedConsumer;
+use bbq2::prod_cons::framed::FramedGrantR;
+use bbq2::prod_cons::framed::FramedProducer;
+use bbq2::queue::BBQueue;
+use bbq2::traits::coordination::cas::AtomicCoord;
+use bbq2::traits::notifier::maitake::MaiNotSpsc;
+use bbq2::traits::storage::Inline;
 pub use radio::InterruptHandler;
 pub use radio::RadioConfig;
 
-/// Size of the FIFO buffer used to store data to be sent or received.
-///
-/// TODO: This should be configurable.
-pub const FIFO_SIZE: usize = 1024;
+const TX_BUF_SIZE: usize = 64;
+const RX_BUF_SIZE: usize = 256;
+
+type Producer<const N: usize> = FramedProducer<
+    &'static BBQueue<Inline<N>, AtomicCoord, MaiNotSpsc>,
+    Inline<N>,
+    AtomicCoord,
+    MaiNotSpsc,
+>;
+
+type Consumer<const N: usize> = FramedConsumer<
+    &'static BBQueue<Inline<N>, AtomicCoord, MaiNotSpsc>,
+    Inline<N>,
+    AtomicCoord,
+    MaiNotSpsc,
+>;
+type Queue<const N: usize> = BBQueue<Inline<N>, AtomicCoord, MaiNotSpsc>;
+
+type GrantR<'a, const N: usize> = FramedGrantR<&'a Queue<N>, Inline<N>, AtomicCoord, MaiNotSpsc>;
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]

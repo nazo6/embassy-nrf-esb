@@ -26,12 +26,12 @@ impl Pid {
         }
     }
 
-    /// Check if the provided PID is the next PID
-    pub fn is_next(&self, other: &Self) -> bool {
-        if self.0 == 0b11 {
-            other.0 == 0
+    /// Checks if the next PID is the same as the given PID
+    pub fn is_next_of(&self, other: &Self) -> bool {
+        if other.0 == 0b11 {
+            self.0 == 0
         } else {
-            self.0 + 1 == other.0
+            self.0 == other.0 + 1
         }
     }
 }
