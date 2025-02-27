@@ -7,7 +7,6 @@ use embassy_nrf::{Peripheral, interrupt, radio::Instance};
 
 use crate::{
     Error,
-    log::debug,
     radio::{InterruptHandler, Radio, RadioConfig},
 };
 
@@ -58,7 +57,7 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> PrxRadio<'d, T, MAX_PACKET_LE
     pub async fn recv(&mut self, buf: &mut [u8], enabled_pipes: u8) -> Result<usize, Error> {
         let (recv_pipe, packet) = self
             .radio
-            .recv(enabled_pipes, true)
+            .recv(enabled_pipes, false)
             .await
             .map_err(Error::Recv)?;
 
