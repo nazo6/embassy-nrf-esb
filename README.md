@@ -1,6 +1,9 @@
 # ESB protocol implementation for embassy-nrf
 
-> [!NOTE]
+Async ESB(Enhanced ShockBurst) protocol implementation for nRF controller. Based
+on [thalesfragoso/esb](https://github.com/thalesfragoso/esb) work.
+
+> [!IMPORTANT]
 >
 > This library is a work in progress and is not yet ready for use.
 
