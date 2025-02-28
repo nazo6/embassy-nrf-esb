@@ -127,7 +127,7 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
             w.set_s1len(3);
         });
         r.pcnf1().write(|w| {
-            w.set_whiteen(true);
+            w.set_whiteen(false);
             w.set_endian(vals::Endian::BIG);
             w.set_balen(ADDR_LENGTH - 1);
             w.set_statlen(0);
@@ -294,23 +294,25 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
         self.clear_all_interrupts();
         r.intenset().write(|w| w.set_disabled(true));
 
+        r.events_address().write_value(0);
+        r.events_payload().write_value(0);
         r.events_disabled().write_value(0);
 
         // Start receive
         dma_start_fence();
         r.tasks_rxen().write_value(1);
 
-        // let dropper = OnDrop::new(|| {
-        //     debug!("receive canceled");
-        //     r.tasks_stop().write_value(1);
-        //     loop {
-        //         match self.read_state() {
-        //             RadioState::DISABLED | RadioState::RX_IDLE => break,
-        //             _ => (),
-        //         }
-        //     }
-        //     dma_end_fence();
-        // });
+        let dropper = OnDrop::new(|| {
+            debug!("receive canceled");
+            r.tasks_stop().write_value(1);
+            loop {
+                match self.read_state() {
+                    RadioState::DISABLED | RadioState::RX_IDLE => break,
+                    _ => (),
+                }
+            }
+            dma_end_fence();
+        });
 
         core::future::poll_fn(|cx| {
             waker.register(cx.waker());
@@ -328,7 +330,7 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
 
         dma_end_fence();
 
-        // dropper.defuse();
+        dropper.defuse();
 
         let pipe = self.check_crc()?;
 
