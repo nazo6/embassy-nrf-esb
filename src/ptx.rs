@@ -5,6 +5,7 @@ use embassy_time::{Duration, Timer};
 
 use crate::{
     Consumer, Error, GrantR, Producer, Queue, RX_BUF_SIZE,
+    log::debug,
     pid::Pid,
     radio::{InterruptHandler, Packet, Radio, RadioConfig},
 };
@@ -22,7 +23,7 @@ pub struct PtxConfig {
 impl Default for PtxConfig {
     fn default() -> Self {
         Self {
-            ack_timeout: Duration::from_micros(120),
+            ack_timeout: Duration::from_micros(100),
             ack_retransmit_delay: Duration::from_micros(500),
             ack_retransmit_attempts: 3,
         }
@@ -71,29 +72,33 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> PtxRadio<'d, T, MAX_PACKET_LE
             .map_err(Error::Send)?;
 
         'ack: {
-            if ack {
-                for _i in 0..self.config.ack_retransmit_attempts {
-                    let c = self.config.clone();
-                    match select(self.recv_ack(pipe), Timer::after(c.ack_timeout)).await {
-                        Either::First(Ok(())) => {
-                            break 'ack;
-                        }
-                        Either::First(Err(e)) => {
-                            return Err(e);
-                        }
-                        _ => {
-                            Timer::after(c.ack_retransmit_delay).await;
-                            self.last_sent_pid.go_next();
-                            self.radio
-                                .send(pipe, &mut packet)
-                                .await
-                                .map_err(Error::Send)?;
-                        }
-                    }
-                }
-
-                return Err(Error::AckTimeout);
-            }
+            // if ack {
+            //     for _i in 0..self.config.ack_retransmit_attempts {
+            //         let c = self.config.clone();
+            //         match select(self.recv_ack(pipe), Timer::after(c.ack_timeout)).await {
+            //             Either::First(Ok(())) => {
+            //                 debug!("ACK Ok");
+            //                 break 'ack;
+            //             }
+            //             Either::First(Err(e)) => {
+            //                 return Err(e);
+            //             }
+            //             _ => {
+            //                 debug!("ACK Retry : {}", _i);
+            //                 self.last_sent_pid.go_next();
+            //                 Timer::after(c.ack_retransmit_delay).await;
+            //                 self.radio
+            //                     .send(pipe, &mut packet)
+            //                     .await
+            //                     .map_err(Error::Send)?;
+            //             }
+            //         }
+            //     }
+            //
+            //     debug!("ACK Timeout");
+            //
+            //     return Err(Error::AckTimeout);
+            // }
         }
 
         Ok(())

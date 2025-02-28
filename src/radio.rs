@@ -127,7 +127,7 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
             w.set_s1len(3);
         });
         r.pcnf1().write(|w| {
-            w.set_whiteen(false);
+            w.set_whiteen(true);
             w.set_endian(vals::Endian::BIG);
             w.set_balen(ADDR_LENGTH - 1);
             w.set_statlen(0);
@@ -198,7 +198,7 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
         pipe: u8,
         packet: &mut Packet<MAX_PACKET_LEN>,
     ) -> Result<(), Error> {
-        debug!("sending data");
+        debug!("Sending data: {:?}", packet.payload());
 
         let r = self.regs();
         let waker = self.waker();
@@ -211,7 +211,7 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
             w.set_end_disable(true);
             w.set_address_rssistart(true);
             w.set_disabled_rssistop(true);
-            w.set_disabled_rxen(ack);
+            w.set_disabled_rxen(false);
         });
 
         r.intenset().write(|w| w.set_disabled(true));
@@ -231,8 +231,8 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
         r.tasks_txen().write_value(1);
         core::future::poll_fn(|cx| {
             waker.register(cx.waker());
-            if r.events_end().read() != 0 {
-                r.events_end().write_value(0);
+            if r.events_disabled().read() != 0 {
+                r.events_disabled().write_value(0);
                 return Poll::Ready(());
             }
 
@@ -241,8 +241,6 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
             Poll::Pending
         })
         .await;
-
-        debug!("sent data");
 
         Ok(())
     }
@@ -256,10 +254,13 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
         enabled_pipes: u8,
         short_tx: bool,
     ) -> Result<(u8, Packet<MAX_PACKET_LEN>), Error> {
+        debug!("pipe:{:?}", enabled_pipes);
         let mut packet = Packet::new_empty();
         self.set_packet_ptr(&mut packet);
         self.prepare_recv(short_tx, enabled_pipes);
         let pipe = self.perform_recv().await?;
+
+        debug!("Received data");
 
         Ok((pipe, packet))
     }
@@ -276,15 +277,11 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
             w.set_end_disable(true);
             w.set_address_rssistart(true);
             w.set_disabled_rssistop(true);
-            w.set_disabled_txen(short_tx);
+            w.set_disabled_txen(false);
         });
 
         r.rxaddresses().write(|w| w.0 = enabled_pipes as u32);
         r.frequency().write(|w| w.set_frequency(self.rf_channel));
-
-        r.events_address().write_value(0);
-        r.events_payload().write_value(0);
-        r.events_disabled().write_value(0);
     }
 
     /// Receive data to buffer specified by `set_packet_ptr`.
@@ -297,27 +294,29 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
         self.clear_all_interrupts();
         r.intenset().write(|w| w.set_disabled(true));
 
+        r.events_disabled().write_value(0);
+
         // Start receive
         dma_start_fence();
         r.tasks_rxen().write_value(1);
 
-        let dropper = OnDrop::new(|| {
-            debug!("receive canceled");
-            r.tasks_stop().write_value(1);
-            loop {
-                match self.read_state() {
-                    RadioState::DISABLED | RadioState::RX_IDLE => break,
-                    _ => (),
-                }
-            }
-            dma_end_fence();
-        });
+        // let dropper = OnDrop::new(|| {
+        //     debug!("receive canceled");
+        //     r.tasks_stop().write_value(1);
+        //     loop {
+        //         match self.read_state() {
+        //             RadioState::DISABLED | RadioState::RX_IDLE => break,
+        //             _ => (),
+        //         }
+        //     }
+        //     dma_end_fence();
+        // });
 
         core::future::poll_fn(|cx| {
             waker.register(cx.waker());
 
-            if r.events_end().read() != 0 {
-                r.events_end().write_value(0);
+            if r.events_disabled().read() != 0 {
+                r.events_disabled().write_value(0);
                 return Poll::Ready(());
             }
 
@@ -329,7 +328,7 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
 
         dma_end_fence();
 
-        dropper.defuse();
+        // dropper.defuse();
 
         let pipe = self.check_crc()?;
 

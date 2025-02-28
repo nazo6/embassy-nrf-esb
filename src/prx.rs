@@ -2,7 +2,7 @@ use embassy_nrf::{Peripheral, interrupt, radio::Instance};
 
 use crate::{
     Consumer, Error, InterruptHandler, Producer, Queue, RX_BUF_SIZE, RadioConfig, TX_BUF_SIZE,
-    log::warn,
+    log::{debug, warn},
     pid::Pid,
     radio::{Packet, Radio},
 };
@@ -41,19 +41,35 @@ impl<T: Instance, const MAX_PACKET_LEN: usize> PrxTask<T, MAX_PACKET_LEN> {
 
         let mut packet = Packet::new_empty();
         self.radio.set_packet_ptr(&mut packet);
-        self.radio.prepare_recv(false, 0xFF);
+        self.radio.prepare_recv(true, 0xFF);
+
+        let mut byte_count = 0;
+        let mut loss_count = 0;
+
         loop {
             match self.radio.perform_recv().await {
                 Ok(pipe) => {
+                    debug!(
+                        "Received data: p:{:?} ack:{:?}",
+                        packet.payload(),
+                        packet.ack()
+                    );
+
+                    byte_count += 1;
+
                     if let Some(latest_recv_pid) = latest_recv_pid {
                         if latest_recv_pid == packet.pid() {
+                            debug!("{:?}", latest_recv_pid);
                             warn!("Duplicate packet received");
-                            continue;
+                            // continue;
                         } else if !packet.pid().is_next_of(&latest_recv_pid) {
+                            loss_count += 1;
                             warn!(
-                                "Invalid packet order: {} -> {}",
+                                "Invalid packet order: {} -> {} ({}/{})",
                                 latest_recv_pid,
-                                packet.pid()
+                                packet.pid(),
+                                loss_count,
+                                byte_count,
                             );
                         }
                     }
@@ -61,6 +77,7 @@ impl<T: Instance, const MAX_PACKET_LEN: usize> PrxTask<T, MAX_PACKET_LEN> {
 
                     let ack = packet.ack();
                     let Ok(mut g) = self.rx_buf_w.grant(packet.payload().len() as u16) else {
+                        warn!("Receive buffer full");
                         continue;
                     };
                     g.copy_from_slice(packet.payload());
