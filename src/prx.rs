@@ -2,7 +2,7 @@ use embassy_nrf::{Peripheral, interrupt, radio::Instance};
 
 use crate::{
     Consumer, Error, InterruptHandler, Producer, Queue, RX_BUF_SIZE, RadioConfig, TX_BUF_SIZE,
-    log::{debug, warn},
+    log::{debug, error, warn},
     pid::Pid,
     radio::{Packet, Radio},
 };
@@ -41,12 +41,12 @@ impl<T: Instance, const MAX_PACKET_LEN: usize> PrxTask<T, MAX_PACKET_LEN> {
 
         let mut packet = Packet::new_empty();
         self.radio.set_packet_ptr(&mut packet);
-        self.radio.prepare_recv(true, 0xFF);
 
         let mut byte_count = 0;
         let mut loss_count = 0;
 
         loop {
+            self.radio.prepare_recv(0xFF, false);
             match self.radio.perform_recv().await {
                 Ok(pipe) => {
                     debug!(
@@ -59,8 +59,7 @@ impl<T: Instance, const MAX_PACKET_LEN: usize> PrxTask<T, MAX_PACKET_LEN> {
 
                     if let Some(latest_recv_pid) = latest_recv_pid {
                         if latest_recv_pid == packet.pid() {
-                            debug!("{:?}", latest_recv_pid);
-                            warn!("Duplicate packet received");
+                            warn!("Duplicate packet received: {:?}", packet.pid());
                             // continue;
                         } else if !packet.pid().is_next_of(&latest_recv_pid) {
                             loss_count += 1;
@@ -76,33 +75,32 @@ impl<T: Instance, const MAX_PACKET_LEN: usize> PrxTask<T, MAX_PACKET_LEN> {
                     latest_recv_pid = Some(packet.pid());
 
                     let ack = packet.ack();
-                    let Ok(mut g) = self.rx_buf_w.grant(packet.payload().len() as u16) else {
-                        warn!("Receive buffer full");
-                        continue;
-                    };
+                    let mut g = self
+                        .rx_buf_w
+                        .wait_grant(packet.payload().len() as u16)
+                        .await;
                     g.copy_from_slice(packet.payload());
                     g.commit(packet.payload().len() as u16);
 
                     if ack {
-                        let res = if let Ok(ack_payload) = self.tx_buf_r.read() {
-                            latest_sent_pid.go_next();
-                            match Packet::new(&ack_payload, latest_sent_pid, false) {
-                                Ok(mut p) => self.radio.send(pipe, &mut p).await,
-                                Err(e) => {
-                                    warn!("Ack data too long: {:?}", e);
-                                    continue;
-                                }
+                        if let Ok(g) = self.tx_buf_r.read() {
+                            if let Err(_e) = packet.set_payload(&g) {
+                                error!("Payload too big");
+                                let _ = packet.set_payload(&[]);
                             }
+                            g.release();
                         } else {
-                            self.radio.send(pipe, &mut Packet::new_empty()).await
-                        };
-                        if let Err(e) = res {
+                            let _ = packet.set_payload(&[]);
+                        }
+                        packet.set_ack(false);
+                        latest_sent_pid.go_next();
+                        packet.set_pid(latest_sent_pid);
+
+                        self.radio.prepare_send(pipe, true);
+                        if let Err(e) = self.radio.perform_send().await {
                             warn!("Ack Send error: {:?}", e);
                         }
-
-                        // When ack is sent, we must prepare recv again.
-                        self.radio.set_packet_ptr(&mut packet);
-                        self.radio.prepare_recv(false, 0xFF);
+                        debug!("Ack sent: {:?}", latest_sent_pid);
                     }
                 }
                 Err(e) => {

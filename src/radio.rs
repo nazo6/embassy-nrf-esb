@@ -185,45 +185,43 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
             .write_value(packet.0.as_ptr() as u32);
     }
 
-    /// Transmits data
-    ///
-    /// # Parameters
-    /// * `pipe`: Pipe (channel) number
-    /// * `buf`: Data to send
-    /// * `ack`: Whether ACK is required or not. This is usually false in PRX.
-    ///
-    /// **NOTE**: If `ack` is true, radio will automatically enter RX mode after send. In such a case, send cannot be executed again unless the recv method is executed!
-    pub async fn send(
-        &mut self,
-        pipe: u8,
-        packet: &mut Packet<MAX_PACKET_LEN>,
-    ) -> Result<(), Error> {
-        debug!("Sending data: {:?}", packet.payload());
+    // ---------------------------------------------------------------------
+    // ------------------------------  SEND  -------------------------------
+    // ---------------------------------------------------------------------
 
+    /// Prepare to send data. By calling `perform_send` after this function, you can send data.
+    pub fn prepare_send(&mut self, pipe: u8, short_rx: bool) {
         let r = self.regs();
-        let waker = self.waker();
 
         self.clear_all_interrupts();
 
-        let ack = packet.ack();
         r.shorts().write(|w| {
             w.set_ready_start(true);
             w.set_end_disable(true);
             w.set_address_rssistart(true);
             w.set_disabled_rssistop(true);
-            w.set_disabled_rxen(false);
+            w.set_disabled_rxen(short_rx);
         });
+
+        r.frequency().write(|w| w.set_frequency(self.rf_channel));
+        r.txaddress().write(|w| w.set_txaddress(pipe));
+
+        if short_rx {
+            r.rxaddresses().write(|w| w.0 = 1 << pipe);
+        }
+    }
+
+    /// Perform send operation.
+    ///
+    /// WARNING: Before calling this function, `prepare_send` and `set_packet_ptr` must be called.
+    pub async fn perform_send(&mut self) -> Result<(), Error> {
+        let r = self.regs();
+        let waker = self.waker();
+
+        self.clear_all_interrupts();
 
         r.intenset().write(|w| w.set_disabled(true));
 
-        r.txaddress().write(|w| w.set_txaddress(pipe));
-        r.rxaddresses().write(|w| w.0 = 1 << pipe);
-
-        r.frequency().write(|w| w.set_frequency(self.rf_channel));
-        self.set_packet_ptr(packet);
-
-        r.events_address().write_value(0);
-        r.events_payload().write_value(0);
         r.events_disabled().write_value(0);
 
         // Start send
@@ -249,25 +247,13 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
     // ------------------------------  RECV  -------------------------------
     // ---------------------------------------------------------------------
 
-    pub async fn recv_once(
-        &mut self,
-        enabled_pipes: u8,
-        short_tx: bool,
-    ) -> Result<(u8, Packet<MAX_PACKET_LEN>), Error> {
-        debug!("pipe:{:?}", enabled_pipes);
-        let mut packet = Packet::new_empty();
-        self.set_packet_ptr(&mut packet);
-        self.prepare_recv(short_tx, enabled_pipes);
-        let pipe = self.perform_recv().await?;
-
-        debug!("Received data");
-
-        Ok((pipe, packet))
-    }
-
-    // -------- RECV utils --------
-
-    pub fn prepare_recv(&mut self, short_tx: bool, enabled_pipes: u8) {
+    /// Prepare to receive data. By calling `perform_recv` after this function, you can receive data.
+    ///
+    /// NOTE: If short_tx is enabled, you have to call `prepare_send` as fast as possible after
+    /// calling call `perform_recv`.
+    /// Specifically, after reception is complete,
+    /// complete the setting within the value (16us) specified in the TIFS register.
+    pub fn prepare_recv(&mut self, enabled_pipes: u8, short_tx: bool) {
         let r = self.regs();
 
         self.clear_all_interrupts();
@@ -277,16 +263,22 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
             w.set_end_disable(true);
             w.set_address_rssistart(true);
             w.set_disabled_rssistop(true);
-            w.set_disabled_txen(false);
+            w.set_disabled_txen(short_tx);
         });
 
-        r.rxaddresses().write(|w| w.0 = enabled_pipes as u32);
         r.frequency().write(|w| w.set_frequency(self.rf_channel));
+        r.rxaddresses().write(|w| w.0 = enabled_pipes as u32);
+
+        if short_tx {
+            r.tifs().write(|w| w.set_tifs(16));
+        }
     }
 
-    /// Receive data to buffer specified by `set_packet_ptr`.
+    /// Perform receive operation.
     ///
     /// Returns the pipe number of the received data.
+    ///
+    /// WARNING: Before calling this function, `prepare_recv` and `set_packet_ptr` must be called.
     pub async fn perform_recv(&mut self) -> Result<u8, Error> {
         let r = self.regs();
         let waker = self.waker();
@@ -448,8 +440,18 @@ impl<const N: usize> Packet<N> {
     }
 
     pub(crate) fn set_pid(&mut self, pid: Pid) {
-        self.0[1] &= !0b11;
+        self.0[1] &= 0b1;
         self.0[1] |= pid.inner() << 1;
+    }
+
+    pub(crate) fn set_payload(&mut self, payload: &[u8]) -> Result<(), Error> {
+        if payload.len() > N - 2 {
+            Err(Error::BufferTooLong)
+        } else {
+            self.0[0] = payload.len() as u8;
+            self.0[2..payload.len() + 2].copy_from_slice(payload);
+            Ok(())
+        }
     }
 }
 

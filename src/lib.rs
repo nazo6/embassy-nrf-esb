@@ -22,6 +22,7 @@ pub mod radio;
 
 use bbq2::prod_cons::framed::FramedConsumer;
 use bbq2::prod_cons::framed::FramedGrantR;
+use bbq2::prod_cons::framed::FramedGrantW;
 use bbq2::prod_cons::framed::FramedProducer;
 use bbq2::queue::BBQueue;
 use bbq2::traits::coordination::cas::AtomicCoord;
@@ -30,7 +31,7 @@ use bbq2::traits::storage::Inline;
 pub use radio::InterruptHandler;
 pub use radio::RadioConfig;
 
-const TX_BUF_SIZE: usize = 64;
+const TX_BUF_SIZE: usize = 256;
 const RX_BUF_SIZE: usize = 256;
 
 type Producer<const N: usize> = FramedProducer<
@@ -49,6 +50,7 @@ type Consumer<const N: usize> = FramedConsumer<
 type Queue<const N: usize> = BBQueue<Inline<N>, AtomicCoord, MaiNotSpsc>;
 
 type GrantR<'a, const N: usize> = FramedGrantR<&'a Queue<N>, Inline<N>, AtomicCoord, MaiNotSpsc>;
+type GrantW<'a, const N: usize> = FramedGrantW<&'a Queue<N>, Inline<N>, AtomicCoord, MaiNotSpsc>;
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
