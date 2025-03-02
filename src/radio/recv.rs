@@ -26,7 +26,6 @@ impl<'a, 'b, 'd, T: Instance, const MAX_PACKET_LEN: usize>
             w.set_end_disable(true);
             w.set_address_rssistart(true);
             w.set_disabled_rssistop(true);
-            w.set_disabled_txen(false);
         });
 
         r.frequency().write(|w| w.set_frequency(radio.rf_channel));

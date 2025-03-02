@@ -1,5 +1,6 @@
 use core::task::Poll;
 
+use embassy_hal_internal::drop::OnDrop;
 use embassy_nrf::radio::{Error, Instance};
 
 use crate::log::debug;
@@ -25,7 +26,6 @@ impl<'a, 'b, 'd, T: Instance, const MAX_PACKET_LEN: usize>
             w.set_end_disable(true);
             w.set_address_rssistart(true);
             w.set_disabled_rssistop(true);
-            w.set_disabled_rxen(false);
         });
 
         r.frequency().write(|w| w.set_frequency(radio.rf_channel));
@@ -51,6 +51,12 @@ impl<'a, 'b, 'd, T: Instance, const MAX_PACKET_LEN: usize>
         r.rxaddresses()
             .write(|w| w.0 = 1 << r.txaddress().read().txaddress() as u32);
 
+        let _dropper = OnDrop::new(|| {
+            r.shorts().modify(|w| {
+                w.set_disabled_rxen(false);
+            });
+        });
+
         self.radio.clear_all_interrupts();
         self.perform_send().await?;
 
@@ -64,11 +70,6 @@ impl<'a, 'b, 'd, T: Instance, const MAX_PACKET_LEN: usize>
     }
 
     pub async fn send(&mut self) -> Result<(), Error> {
-        let r = self.radio.regs();
-        r.shorts().modify(|w| {
-            w.set_disabled_rxen(false);
-        });
-
         self.perform_send().await
     }
 
