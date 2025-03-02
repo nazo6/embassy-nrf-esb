@@ -15,13 +15,11 @@
 
 pub mod addresses;
 mod log;
-pub mod pid;
 pub mod prx;
 pub mod ptx;
-pub mod radio;
+mod radio;
 
 use bbq2::prod_cons::framed::FramedConsumer;
-use bbq2::prod_cons::framed::FramedGrantR;
 use bbq2::prod_cons::framed::FramedGrantW;
 use bbq2::prod_cons::framed::FramedProducer;
 use bbq2::queue::BBQueue;
@@ -49,7 +47,7 @@ type Consumer<const N: usize> = FramedConsumer<
 >;
 type Queue<const N: usize> = BBQueue<Inline<N>, AtomicCoord, MaiNotSpsc>;
 
-type GrantR<'a, const N: usize> = FramedGrantR<&'a Queue<N>, Inline<N>, AtomicCoord, MaiNotSpsc>;
+// type GrantR<'a, const N: usize> = FramedGrantR<&'a Queue<N>, Inline<N>, AtomicCoord, MaiNotSpsc>;
 type GrantW<'a, const N: usize> = FramedGrantW<&'a Queue<N>, Inline<N>, AtomicCoord, MaiNotSpsc>;
 
 #[derive(Debug, Clone)]

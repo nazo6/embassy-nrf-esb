@@ -1,0 +1,52 @@
+@startuml
+!pragma teoz true
+
+box "PTX"
+  participant "PTX CPU"
+  participant "PTX Packet ptr"
+  participant "PTX Radio"
+end box
+box "PRX"
+    participant "PRX Radio"
+    participant "PRX Packet ptr"
+    participant "PRX CPU"
+end box
+
+loop
+"PRX CPU"-> "PRX Packet ptr": Set recv buffer
+& "PTX CPU"->"PTX Packet ptr": Set send data/recv buf
+note across: Transmit sequence start
+"PTX CPU"->"PTX Radio": Start send
+activate "PTX Radio" #pink
+& "PRX CPU"->"PRX Radio": Start recv
+activate "PRX Radio" #blue
+"PTX Packet ptr"-->"PTX Radio": Read data
+"PTX Radio"-->"PRX Radio": Send data
+"PTX Radio"->"PTX CPU": Send complete notify
+deactivate "PTX Radio"
+& "PRX Radio"-->"PRX Packet ptr": Set payload
+"PRX Radio"->"PRX CPU": Recv complete notify
+deactivate "PRX Radio"
+opt ack=true
+    "PTX Radio"->"PTX Radio": Start recv\n(short)
+    activate "PTX Radio" #blue
+    & "PTX CPU"->"PTX CPU": Wait for ack or timeout
+    alt Send successfull
+        "PRX CPU"->"PRX Packet ptr": Set send data
+        "PRX CPU"->"PRX Radio": Start send
+        activate "PRX Radio" #pink
+        "PRX Packet ptr"-->"PRX Radio": Read data
+        "PRX Radio"->"PTX Radio": Send ack
+        "PRX Radio"->"PRX CPU": Send complete notify
+        deactivate "PRX Radio"
+        & "PTX Radio"-->"PTX Packet ptr": Set payload
+        "PTX Radio"->"PTX CPU": Recv complete notify
+    else Send unsuccessfull
+        opt Less than retransmission count
+            "PTX CPU"->"PTX CPU": Wait for\nretransmission delay
+            note over "PTX CPU": Goto "Transmit sequence start"
+        end
+        deactivate "PTX Radio"
+    end
+end
+@enduml
