@@ -90,11 +90,11 @@ impl<T: Instance, const MAX_PACKET_LEN: usize> PrxTask<T, MAX_PACKET_LEN> {
         if let Ok(g) = tx_buf_r.read() {
             if let Err(_e) = p.set_payload(&g) {
                 error!("Payload too big");
-                let _ = p.set_payload(&[]);
+                let _ = p.set_payload(&[0, 1, 2]);
             }
             g.release();
         } else {
-            let _ = p.set_payload(&[]);
+            let _ = p.set_payload(&[2, 1, 0]);
         }
         p.set_ack(false);
         p.set_pid(pid);

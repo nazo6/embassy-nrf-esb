@@ -1,12 +1,18 @@
 //! ESB driver for PTX side
-use embassy_futures::select::{Either, select};
+use core::task::Poll;
+
+use embassy_hal_internal::drop::OnDrop;
 use embassy_nrf::{Peripheral, interrupt, radio::Instance};
 use embassy_time::Duration;
+use nrf_pac::radio::vals::{self, Crcstatus};
 
 use crate::{
     Consumer, Error, GrantW, Producer, Queue, RX_BUF_SIZE, TX_BUF_SIZE,
-    log::{debug, error},
-    radio::{InterruptHandler, Radio, RadioConfig, packet::Packet, pid::Pid, send::RadioSend},
+    log::{debug, error, warn},
+    radio::{
+        InterruptHandler, Radio, RadioConfig, dma_end_fence, dma_start_fence, packet::Packet,
+        pid::Pid,
+    },
 };
 
 static RX_BUF: Queue<RX_BUF_SIZE> = Queue::new();
@@ -43,8 +49,8 @@ pub struct PtxConfig {
 impl Default for PtxConfig {
     fn default() -> Self {
         Self {
-            ack_timeout: Duration::from_millis(10000),
-            ack_retransmit_delay: Duration::from_micros(500),
+            ack_timeout: Duration::from_millis(1),
+            ack_retransmit_delay: Duration::from_micros(100),
             ack_retransmit_attempts: 3,
         }
     }
@@ -60,9 +66,8 @@ pub struct PtxTask<T: Instance, const MAX_PACKET_LEN: usize> {
 impl<T: Instance, const MAX_PACKET_LEN: usize> PtxTask<T, MAX_PACKET_LEN> {
     pub async fn run(&mut self) {
         let mut pid_send = Pid::default();
-        let mut packet = Packet::new_empty();
         loop {
-            match self.transmit(&mut packet, pid_send).await {
+            match self.run_inner(pid_send).await {
                 Ok(_) => {}
                 Err(e) => {
                     error!("Send Error: {:?}", e);
@@ -72,13 +77,130 @@ impl<T: Instance, const MAX_PACKET_LEN: usize> PtxTask<T, MAX_PACKET_LEN> {
         }
     }
 
+    async fn run_inner(&mut self, pid: Pid) -> Result<(), Error> {
+        let r = self.radio.regs();
+
+        // Receive packet from buffer
+        let mut packet = core::pin::pin!(Packet::new_empty());
+        let pipe = Self::load_data_to_transmit(&self.tx_buf_r, &mut packet, pid).await?;
+        self.radio.set_packet_ptr(&mut packet);
+
+        let ack_required = packet.ack();
+
+        r.txaddress().write(|w| w.set_txaddress(pipe));
+
+        // Make sure that disabled_rxen is disabled even if this function is dropped.
+
+        r.events_disabled().write_value(0);
+        r.events_payload().write_value(0);
+        r.events_address().write_value(0);
+
+        if ack_required {
+            // Create 'backup' packet to retransmit as original packet will be overwritten
+            let packet_backup = packet.clone();
+            r.rxaddresses().write(|w| w.0 = 1 << pipe as u32);
+            'ack_success: {
+                for _ in 0..self.config.ack_retransmit_attempts {
+                    debug!("Sending packet: {:?}", packet.payload());
+                    {
+                        let _send_cleanup = OnDrop::new(|| {
+                            r.shorts().modify(|w| {
+                                w.set_disabled_rxen(false);
+                            });
+                        });
+
+                        r.shorts().modify(|w| {
+                            w.set_disabled_rxen(true);
+                        });
+
+                        self.perform_tx(true).await;
+                        embassy_time::Timer::after(self.config.ack_timeout).await;
+                    }
+
+                    if r.events_end().read() == 1
+                        && r.crcstatus().read().crcstatus() == Crcstatus::CRCOK
+                    {
+                        debug!(
+                            "ACK recv: {:?}, status: {:?}",
+                            packet.payload(),
+                            r.state().read().state()
+                        );
+
+                        r.events_end().write_value(0);
+                        let _ = Self::save_received_data(&self.rx_buf_w, &packet);
+                        break 'ack_success;
+                    } else {
+                        warn!("ACK recv failed");
+                        embassy_time::Timer::after(self.config.ack_retransmit_delay).await;
+                        // Failed to receive ack, retransmit
+                        self.stop_rx();
+                        *packet = packet_backup.clone();
+                    }
+                }
+                warn!("ACK recv gave up");
+            }
+        } else {
+            self.perform_tx(false).await;
+        }
+
+        debug!("Send done");
+        self.stop_rx();
+
+        Ok(())
+    }
+
+    fn stop_rx(&mut self) {
+        let r = self.radio.regs();
+
+        loop {
+            match r.state().read().state() {
+                vals::State::DISABLED => break,
+                vals::State::RX_IDLE => {
+                    r.tasks_disable().write_value(1);
+                }
+                _ => {
+                    r.tasks_stop().write_value(1);
+                }
+            }
+        }
+    }
+
+    async fn perform_tx(&mut self, wait_rx: bool) {
+        let r = self.radio.regs();
+        let w = self.radio.waker();
+
+        self.radio.clear_all_interrupts();
+        r.intenset().write(|w| {
+            w.set_disabled(true);
+        });
+        r.events_disabled().write_value(0);
+
+        dma_start_fence();
+        r.tasks_txen().write_value(1);
+        core::future::poll_fn(|cx| {
+            w.register(cx.waker());
+            if r.events_disabled().read() != 0 {
+                r.events_disabled().write_value(0);
+                r.events_end().write_value(0);
+                return Poll::Ready(());
+            }
+
+            r.intenset().write(|w| w.set_disabled(true));
+
+            Poll::Pending
+        })
+        .await;
+    }
+
     async fn load_data_to_transmit(
-        &mut self,
+        tx_buf_r: &Consumer<TX_BUF_SIZE>,
         p: &mut Packet<MAX_PACKET_LEN>,
         pid: Pid,
     ) -> Result<u8, Error> {
-        let r = self.tx_buf_r.wait_read().await;
+        let r = tx_buf_r.wait_read().await;
         if let Err(_e) = p.set_payload(&r[2..r.len()]) {
+            warn!("TX payload too big");
+            r.release();
             return Err(Error::BufferTooLong);
         }
 
@@ -93,55 +215,19 @@ impl<T: Instance, const MAX_PACKET_LEN: usize> PtxTask<T, MAX_PACKET_LEN> {
         Ok(pipe)
     }
 
-    fn save_received_data(&mut self, p: &Packet<MAX_PACKET_LEN>) -> Result<(), Error> {
-        let Ok(mut w) = self.rx_buf_w.grant(p.payload().len() as u16) else {
+    fn save_received_data(
+        rx_buf_w: &Producer<RX_BUF_SIZE>,
+        p: &Packet<MAX_PACKET_LEN>,
+    ) -> Result<(), Error> {
+        if p.payload().is_empty() {
+            return Ok(());
+        }
+        let Ok(mut w) = rx_buf_w.grant(p.payload().len() as u16) else {
+            // warn!("RX buffer full");
             return Err(Error::BufferTooLong);
         };
         w.copy_from_slice(p.payload());
         w.commit(p.payload().len() as u16);
-
-        Ok(())
-    }
-
-    async fn transmit(
-        &mut self,
-        packet: &mut Packet<MAX_PACKET_LEN>,
-        pid: Pid,
-    ) -> Result<(), Error> {
-        let pipe = self.load_data_to_transmit(packet, pid).await?;
-
-        let mut sender = RadioSend::new(&mut self.radio, pipe, packet);
-        if sender.packet.ack() {
-            let packet_backup = sender.packet.clone();
-            let mut i = 0;
-            'ack: loop {
-                *sender.packet = packet_backup.clone();
-                let mut receiver = sender.send_and_recv().await.map_err(Error::Send)?;
-                match select(
-                    receiver.recv(),
-                    embassy_time::Timer::after(self.config.ack_timeout),
-                )
-                .await
-                {
-                    Either::First(Ok(pipe)) => {
-                        self.save_received_data(packet)?;
-                        break 'ack;
-                    }
-                    Either::First(Err(e)) => {
-                        return Err(Error::Send(e));
-                    }
-                    Either::Second(_) => {
-                        if i == self.config.ack_retransmit_attempts {
-                            return Err(Error::AckTimeout);
-                        }
-                        embassy_time::Timer::after(self.config.ack_retransmit_delay).await;
-                        i += 1;
-                    }
-                }
-            }
-        } else {
-            sender.send().await.map_err(Error::Send)?;
-        }
 
         Ok(())
     }

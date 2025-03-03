@@ -134,6 +134,7 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
             w.set_statlen(0);
             w.set_maxlen(MAX_PACKET_LEN as u8);
         });
+        r.tifs().write(|w| w.set_tifs(0));
 
         // crc config
         const CRC_INIT: u32 = 0x0000_FFFF;
@@ -152,6 +153,13 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
         r.prefix0().write(|w| w.0 = prefix0);
         r.prefix1().write(|w| w.0 = prefix1);
 
+        r.shorts().write(|w| {
+            w.set_ready_start(true);
+            w.set_end_disable(true);
+            w.set_address_rssistart(true);
+            w.set_disabled_rssistop(true);
+        });
+
         // Enable NVIC interrupt
         T::Interrupt::unpend();
         unsafe { T::Interrupt::enable() };
@@ -159,28 +167,28 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
         radio
     }
 
-    fn regs(&mut self) -> pac::radio::Radio {
+    pub fn regs(&mut self) -> pac::radio::Radio {
         embassy_nrf::pac::RADIO
     }
 
-    fn waker(&mut self) -> &'static AtomicWaker {
+    pub fn waker(&mut self) -> &'static AtomicWaker {
         &WAKER
     }
 
     /// Clear interrupts
-    fn clear_all_interrupts(&mut self) {
+    pub fn clear_all_interrupts(&mut self) {
         self.regs().intenclr().write(|w| w.0 = 0xffff_ffff);
     }
 
     /// Get the current radio state
-    fn read_state(&mut self) -> RadioState {
+    pub fn read_state(&mut self) -> RadioState {
         self.regs().state().read().state()
     }
 
     // Set pointer to be used for DMA transfer
     //
     // buffer task mutable reference to ensure that the buffer is in RAM.
-    fn set_packet_ptr(&mut self, packet: &mut Packet<MAX_PACKET_LEN>) {
+    pub fn set_packet_ptr(&mut self, packet: &mut Packet<MAX_PACKET_LEN>) {
         self.regs()
             .packetptr()
             .write_value(packet.0.as_ptr() as u32);
@@ -190,9 +198,11 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
 /// NOTE must be followed by a volatile write operation
 pub(crate) fn dma_start_fence() {
     compiler_fence(Ordering::Release);
+    core::sync::atomic::fence(Ordering::SeqCst);
 }
 
 /// NOTE must be preceded by a volatile read operation
 pub(crate) fn dma_end_fence() {
     compiler_fence(Ordering::Acquire);
+    core::sync::atomic::fence(Ordering::SeqCst);
 }

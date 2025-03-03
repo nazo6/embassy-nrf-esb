@@ -2,10 +2,27 @@ use core::task::Poll;
 
 use embassy_hal_internal::drop::OnDrop;
 use embassy_nrf::radio::{Error, Instance};
+use nrf_pac::radio::vals;
 
 use crate::log::debug;
 
 use super::{Packet, Radio, dma_start_fence, recv::RadioRecv};
+
+pub struct RadioRecvDropper<'a, 'b, 'd, T: Instance, const MAX_PACKET_LEN: usize>(
+    pub RadioRecv<'a, 'b, 'd, T, MAX_PACKET_LEN>,
+);
+
+impl<T: Instance, const MAX_PACKET_LEN: usize> Drop
+    for RadioRecvDropper<'_, '_, '_, T, MAX_PACKET_LEN>
+{
+    fn drop(&mut self) {
+        let r = self.0.radio.regs();
+        if r.state().read().state() == vals::State::RX {
+            r.tasks_stop().write_value(1);
+            while r.state().read().state() != vals::State::DISABLED {}
+        }
+    }
+}
 
 pub struct RadioSend<'a, 'b, 'd, T: Instance, const MAX_PACKET_LEN: usize> {
     pub(crate) radio: &'a mut Radio<'d, T, MAX_PACKET_LEN>,
@@ -42,7 +59,7 @@ impl<'a, 'b, 'd, T: Instance, const MAX_PACKET_LEN: usize>
     /// * Ok(pipe): The pipe number that received the packet.
     pub async fn send_and_recv(
         &mut self,
-    ) -> Result<RadioRecv<'_, '_, 'd, T, MAX_PACKET_LEN>, Error> {
+    ) -> Result<RadioRecvDropper<'_, '_, 'd, T, MAX_PACKET_LEN>, Error> {
         let r = self.radio.regs();
         r.shorts().modify(|w| {
             w.set_disabled_rxen(true);
@@ -62,10 +79,10 @@ impl<'a, 'b, 'd, T: Instance, const MAX_PACKET_LEN: usize>
 
         // Safety: It is safe to initialize RadioRecv without initializer because this function
         // already set the radio correctly.
-        let recv = RadioRecv {
+        let recv = RadioRecvDropper(RadioRecv {
             radio: self.radio,
             packet: self.packet,
-        };
+        });
         Ok(recv)
     }
 
