@@ -3,7 +3,7 @@ use embassy_nrf::{Peripheral, interrupt, radio::Instance};
 use crate::{
     Consumer, Error, InterruptHandler, Producer, Queue, RX_BUF_SIZE, RadioConfig, TX_BUF_SIZE,
     log::{debug, error, warn},
-    radio::{Radio, packet::Packet, pid::Pid, recv::RadioRecv, send::RadioSend},
+    radio::{Radio, packet::Packet, pid::Pid},
 };
 
 static TX_BUF: Queue<TX_BUF_SIZE> = Queue::new();
@@ -35,20 +35,26 @@ pub struct PrxTask<T: Instance, const MAX_PACKET_LEN: usize> {
 
 impl<T: Instance, const MAX_PACKET_LEN: usize> PrxTask<T, MAX_PACKET_LEN> {
     pub async fn run(&mut self) {
+        let r = self.radio.regs();
+
         let mut latest_recv_pid: Option<Pid> = None;
 
-        let mut packet = Packet::new_empty();
-        let mut recv = RadioRecv::new(&mut self.radio, 0xFF, &mut packet);
+        let mut packet = core::pin::pin!(Packet::new_empty());
 
         let mut byte_count = 0;
         let mut loss_count = 0;
 
+        r.rxaddresses().write(|w| w.0 = 0xFF);
+        self.radio.set_packet_ptr(&mut packet);
+
         loop {
-            let res = recv.recv().await;
+            r.shorts().modify(|w| w.set_disabled_txen(true));
+            let res = self.radio.perform_rx().await;
+            r.shorts().modify(|w| w.set_disabled_txen(false));
             match res {
                 Ok(pipe) => {
-                    let recv_pid = recv.packet.pid();
-                    let ack = recv.packet.ack();
+                    let recv_pid = packet.pid();
+                    let ack = packet.ack();
 
                     byte_count += 1;
 
@@ -56,7 +62,7 @@ impl<T: Instance, const MAX_PACKET_LEN: usize> PrxTask<T, MAX_PACKET_LEN> {
                         if latest_recv_pid == recv_pid {
                             warn!("Duplicate packet received: {:?}", recv_pid);
                             // continue;
-                        } else if !recv.packet.pid().is_next_of(&latest_recv_pid) {
+                        } else if !packet.pid().is_next_of(&latest_recv_pid) {
                             loss_count += 1;
                             warn!(
                                 "Invalid packet order: {} -> {} ({}/{})",
@@ -64,15 +70,16 @@ impl<T: Instance, const MAX_PACKET_LEN: usize> PrxTask<T, MAX_PACKET_LEN> {
                             );
                         }
                     }
-                    latest_recv_pid = Some(recv.packet.pid());
-                    Self::save_received_data(&self.rx_buf_w, recv.packet).await;
+                    latest_recv_pid = Some(recv_pid);
+                    if let Err(e) = Self::save_received_data(&self.rx_buf_w, &*packet) {
+                        // todo
+                    }
 
                     if ack {
-                        Self::load_data_to_transmit(&self.tx_buf_r, recv.packet, recv_pid);
-                        let mut sender = recv.get_sender();
-                        if let Err(e) = sender.send().await {
-                            warn!("Ack Send error: {:?}", e);
-                        }
+                        r.txaddress().write(|w| w.set_txaddress(pipe));
+                        Self::load_data_to_transmit(&self.tx_buf_r, &mut *packet, recv_pid);
+                        self.radio.perform_tx().await;
+                        debug!("PRX: Sent ACK packet: {:?}", packet.payload());
                     }
                 }
                 Err(e) => {
@@ -100,10 +107,16 @@ impl<T: Instance, const MAX_PACKET_LEN: usize> PrxTask<T, MAX_PACKET_LEN> {
         p.set_pid(pid);
     }
 
-    async fn save_received_data(rx_buf_w: &Producer<RX_BUF_SIZE>, p: &Packet<MAX_PACKET_LEN>) {
-        let mut g = rx_buf_w.wait_grant(p.payload().len() as u16).await;
+    fn save_received_data(
+        rx_buf_w: &Producer<RX_BUF_SIZE>,
+        p: &Packet<MAX_PACKET_LEN>,
+    ) -> Result<(), Error> {
+        let Ok(mut g) = rx_buf_w.grant(p.payload().len() as u16) else {
+            return Err(Error::BufferTooLong);
+        };
         g.copy_from_slice(p.payload());
         g.commit(p.payload().len() as u16);
+        Ok(())
     }
 }
 

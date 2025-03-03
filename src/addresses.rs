@@ -68,7 +68,7 @@ impl Default for Addresses {
             base1: [0xC2, 0xC2, 0xC2, 0xC2],
             prefixes0: [0xE7, 0xC2, 0xC3, 0xC4],
             prefixes1: [0xC5, 0xC6, 0xC7, 0xC8],
-            rf_channel: 100,
+            rf_channel: 50,
         }
     }
 }

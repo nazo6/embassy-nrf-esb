@@ -5,8 +5,11 @@
 
 use core::marker::PhantomData;
 use core::sync::atomic::{Ordering, compiler_fence};
+use core::task::Poll;
 
+use embassy_hal_internal::drop::OnDrop;
 use embassy_hal_internal::{PeripheralRef, into_ref};
+use embassy_nrf::radio::Error as RadioError;
 use embassy_nrf::{
     Peripheral,
     interrupt::{self, typelevel::Interrupt},
@@ -19,12 +22,11 @@ use embassy_nrf::{
 use embassy_sync::waitqueue::AtomicWaker;
 use packet::Packet;
 
+use crate::Error;
 use crate::addresses::{ADDR_LENGTH, Addresses, address_conversion, bytewise_bit_swap};
 
 pub(crate) mod packet;
 pub(crate) mod pid;
-pub(crate) mod recv;
-pub(crate) mod send;
 
 static WAKER: AtomicWaker = AtomicWaker::new();
 
@@ -67,7 +69,6 @@ impl Default for RadioConfig {
 /// NOTE: `MAX_PACKET_LEN` is `payload length + 2` bytes (Internally, it is used for S1 and LENGTH)
 pub(crate) struct Radio<'d, T: Instance, const MAX_PACKET_LEN: usize> {
     _p: PeripheralRef<'d, T>,
-    rf_channel: u8,
 }
 
 impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> {
@@ -93,10 +94,7 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
 
         into_ref!(radio);
 
-        let mut radio = Self {
-            _p: radio,
-            rf_channel: config.addresses.rf_channel,
-        };
+        let mut radio = Self { _p: radio };
 
         let r = radio.regs();
 
@@ -128,13 +126,12 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
             w.set_s1len(3);
         });
         r.pcnf1().write(|w| {
-            w.set_whiteen(false);
+            w.set_whiteen(true);
             w.set_endian(vals::Endian::BIG);
             w.set_balen(ADDR_LENGTH - 1);
             w.set_statlen(0);
             w.set_maxlen(MAX_PACKET_LEN as u8);
         });
-        r.tifs().write(|w| w.set_tifs(0));
 
         // crc config
         const CRC_INIT: u32 = 0x0000_FFFF;
@@ -192,6 +189,91 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
         self.regs()
             .packetptr()
             .write_value(packet.0.as_ptr() as u32);
+    }
+
+    pub async fn perform_tx(&mut self) {
+        let r = self.regs();
+        let w = self.waker();
+
+        self.clear_all_interrupts();
+        r.intenset().write(|w| w.set_disabled(true));
+        r.events_disabled().write_value(0);
+
+        dma_start_fence();
+        r.tasks_txen().write_value(1);
+        core::future::poll_fn(|cx| {
+            w.register(cx.waker());
+            if r.events_disabled().read() != 0 {
+                r.events_disabled().write_value(0);
+                r.events_end().write_value(0);
+                return Poll::Ready(());
+            }
+
+            r.intenset().write(|w| w.set_disabled(true));
+
+            Poll::Pending
+        })
+        .await;
+    }
+
+    pub async fn perform_rx(&mut self) -> Result<u8, Error> {
+        let r = self.regs();
+        let w = self.waker();
+
+        self.clear_all_interrupts();
+
+        r.intenset().write(|w| w.set_disabled(true));
+
+        r.events_address().write_value(0);
+        r.events_payload().write_value(0);
+        r.events_disabled().write_value(0);
+
+        // Start receive
+        dma_start_fence();
+        r.tasks_rxen().write_value(1);
+
+        let dropper = OnDrop::new(|| {
+            r.tasks_stop().write_value(1);
+            loop {
+                match self.read_state() {
+                    vals::State::DISABLED | vals::State::RX_IDLE => break,
+                    _ => (),
+                }
+            }
+            dma_end_fence();
+        });
+
+        core::future::poll_fn(|cx| {
+            w.register(cx.waker());
+
+            if r.events_disabled().read() != 0 {
+                r.events_disabled().write_value(0);
+                return Poll::Ready(());
+            }
+
+            r.intenset().write(|w| w.set_disabled(true));
+
+            Poll::Pending
+        })
+        .await;
+
+        dma_end_fence();
+
+        dropper.defuse();
+
+        let pipe = self.check_crc().map_err(Error::Recv)?;
+
+        Ok(pipe)
+    }
+
+    fn check_crc(&mut self) -> Result<u8, RadioError> {
+        let r = self.regs();
+        let crc = r.rxcrc().read().rxcrc() as u16;
+        if r.crcstatus().read().crcstatus() == vals::Crcstatus::CRCOK {
+            Ok(r.rxmatch().read().rxmatch())
+        } else {
+            Err(RadioError::CrcFailed(crc))
+        }
     }
 }
 

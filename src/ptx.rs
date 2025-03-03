@@ -1,5 +1,4 @@
 //! ESB driver for PTX side
-use core::task::Poll;
 
 use embassy_hal_internal::drop::OnDrop;
 use embassy_nrf::{Peripheral, interrupt, radio::Instance};
@@ -9,10 +8,7 @@ use nrf_pac::radio::vals::{self, Crcstatus};
 use crate::{
     Consumer, Error, GrantW, Producer, Queue, RX_BUF_SIZE, TX_BUF_SIZE,
     log::{debug, error, warn},
-    radio::{
-        InterruptHandler, Radio, RadioConfig, dma_end_fence, dma_start_fence, packet::Packet,
-        pid::Pid,
-    },
+    radio::{InterruptHandler, Radio, RadioConfig, packet::Packet, pid::Pid},
 };
 
 static RX_BUF: Queue<RX_BUF_SIZE> = Queue::new();
@@ -49,7 +45,7 @@ pub struct PtxConfig {
 impl Default for PtxConfig {
     fn default() -> Self {
         Self {
-            ack_timeout: Duration::from_millis(1),
+            ack_timeout: Duration::from_micros(60),
             ack_retransmit_delay: Duration::from_micros(100),
             ack_retransmit_attempts: 3,
         }
@@ -113,7 +109,7 @@ impl<T: Instance, const MAX_PACKET_LEN: usize> PtxTask<T, MAX_PACKET_LEN> {
                             w.set_disabled_rxen(true);
                         });
 
-                        self.perform_tx(true).await;
+                        self.radio.perform_tx().await;
                         embassy_time::Timer::after(self.config.ack_timeout).await;
                     }
 
@@ -140,7 +136,7 @@ impl<T: Instance, const MAX_PACKET_LEN: usize> PtxTask<T, MAX_PACKET_LEN> {
                 warn!("ACK recv gave up");
             }
         } else {
-            self.perform_tx(false).await;
+            self.radio.perform_tx().await;
         }
 
         debug!("Send done");
@@ -163,33 +159,6 @@ impl<T: Instance, const MAX_PACKET_LEN: usize> PtxTask<T, MAX_PACKET_LEN> {
                 }
             }
         }
-    }
-
-    async fn perform_tx(&mut self, wait_rx: bool) {
-        let r = self.radio.regs();
-        let w = self.radio.waker();
-
-        self.radio.clear_all_interrupts();
-        r.intenset().write(|w| {
-            w.set_disabled(true);
-        });
-        r.events_disabled().write_value(0);
-
-        dma_start_fence();
-        r.tasks_txen().write_value(1);
-        core::future::poll_fn(|cx| {
-            w.register(cx.waker());
-            if r.events_disabled().read() != 0 {
-                r.events_disabled().write_value(0);
-                r.events_end().write_value(0);
-                return Poll::Ready(());
-            }
-
-            r.intenset().write(|w| w.set_disabled(true));
-
-            Poll::Pending
-        })
-        .await;
     }
 
     async fn load_data_to_transmit(
