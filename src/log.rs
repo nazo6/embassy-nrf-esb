@@ -1,3 +1,4 @@
+#[collapse_debuginfo(yes)]
 macro_rules! debug {
         ($($arg:tt)*) => {
             #[cfg(feature = "defmt")]
@@ -8,6 +9,7 @@ macro_rules! debug {
     }
 pub(crate) use debug;
 
+#[collapse_debuginfo(yes)]
 macro_rules! info {
         ($($arg:tt)*) => {
             #[cfg(feature = "defmt")]
@@ -18,6 +20,7 @@ macro_rules! info {
     }
 pub(crate) use info;
 
+#[collapse_debuginfo(yes)]
 macro_rules! warni {
         ($($arg:tt)*) => {
             #[cfg(feature = "defmt")]
@@ -28,6 +31,7 @@ macro_rules! warni {
     }
 pub(crate) use warni as warn;
 
+#[collapse_debuginfo(yes)]
 macro_rules! error {
         ($($arg:tt)*) => {
             #[cfg(feature = "defmt")]
