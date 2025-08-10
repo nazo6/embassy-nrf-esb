@@ -8,10 +8,9 @@ use core::sync::atomic::{Ordering, compiler_fence};
 use core::task::Poll;
 
 use embassy_hal_internal::drop::OnDrop;
-use embassy_hal_internal::{PeripheralRef, into_ref};
 use embassy_nrf::radio::Error as RadioError;
 use embassy_nrf::{
-    Peripheral,
+    Peri,
     interrupt::{self, typelevel::Interrupt},
     pac::{
         self,
@@ -68,7 +67,7 @@ impl Default for RadioConfig {
 ///
 /// NOTE: `MAX_PACKET_LEN` is `payload length + 2` bytes (Internally, it is used for S1 and LENGTH)
 pub(crate) struct Radio<'d, T: Instance, const MAX_PACKET_LEN: usize> {
-    _p: PeripheralRef<'d, T>,
+    _p: Peri<'d, T>,
 }
 
 impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> {
@@ -77,7 +76,7 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
     /// **IMPORTANT**: Do **NOT** use peripheral other than [`embassy_nrf::peripherals::RADIO`].
     /// It can cause unexpected behavior.
     pub fn new(
-        radio: impl Peripheral<P = T> + 'd,
+        radio: Peri<'d, T>,
         _irq: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'd,
         config: RadioConfig,
     ) -> Self {
@@ -91,8 +90,6 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
                 "MAX_PACKET_LEN must be greater than or equal to 3"
             )
         }
-
-        into_ref!(radio);
 
         let mut radio = Self { _p: radio };
 
@@ -164,6 +161,7 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
         radio
     }
 
+    // FIXME: Same as above, hard-coded RADIO is used.
     pub fn regs(&mut self) -> pac::radio::Radio {
         embassy_nrf::pac::RADIO
     }
@@ -244,6 +242,8 @@ impl<'d, T: Instance, const MAX_PACKET_LEN: usize> Radio<'d, T, MAX_PACKET_LEN> 
         });
 
         core::future::poll_fn(|cx| {
+            defmt::debug!("rx wake");
+
             w.register(cx.waker());
 
             if r.events_disabled().read() != 0 {

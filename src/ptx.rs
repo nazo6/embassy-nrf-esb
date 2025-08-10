@@ -1,7 +1,7 @@
 //! ESB driver for PTX side
 
 use embassy_hal_internal::drop::OnDrop;
-use embassy_nrf::{Peripheral, interrupt, radio::Instance};
+use embassy_nrf::{Peri, interrupt, radio::Instance};
 use embassy_time::Duration;
 use nrf_pac::radio::vals::{self, Crcstatus};
 
@@ -16,7 +16,7 @@ static RX_BUF: Queue<RX_BUF_SIZE> = Queue::new();
 static TX_BUF: Queue<TX_BUF_SIZE> = Queue::new();
 
 pub fn new_ptx<T: Instance, const MAX_PACKET_LEN: usize>(
-    radio: impl Peripheral<P = T> + 'static,
+    radio: Peri<'static, T>,
     irq: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'static,
     config: RadioConfig,
     ptx_config: PtxConfig,
@@ -231,6 +231,7 @@ impl PtxInterface {
         g[0] = ack as u8;
         g[1] = pipe;
         g[2..2 + payload.len()].copy_from_slice(payload);
+
         g.commit((payload.len() + 2) as u16);
 
         Ok(())

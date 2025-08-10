@@ -1,4 +1,4 @@
-use embassy_nrf::{Peripheral, interrupt, radio::Instance};
+use embassy_nrf::{Peri, interrupt, radio::Instance};
 
 use crate::{
     Consumer, Error, InterruptHandler, Producer, Queue, RX_BUF_SIZE, RadioConfig, TX_BUF_SIZE,
@@ -10,7 +10,7 @@ static TX_BUF: Queue<TX_BUF_SIZE> = Queue::new();
 static RX_BUF: Queue<RX_BUF_SIZE> = Queue::new();
 
 pub fn new_prx<T: Instance, const MAX_PACKET_LEN: usize>(
-    radio: impl Peripheral<P = T> + 'static,
+    radio: Peri<'static, T>,
     irq: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'static,
     config: RadioConfig,
 ) -> (PrxTask<T, MAX_PACKET_LEN>, PrxInterface) {
@@ -53,6 +53,7 @@ impl<T: Instance, const MAX_PACKET_LEN: usize> PrxTask<T, MAX_PACKET_LEN> {
             r.shorts().modify(|w| w.set_disabled_txen(false));
             match res {
                 Ok(pipe) => {
+                    debug!("PRX: Received packet on pipe: {}", pipe);
                     let recv_pid = packet.pid();
                     let ack = packet.ack();
 
